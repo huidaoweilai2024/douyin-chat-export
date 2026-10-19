@@ -1,11 +1,11 @@
 <template>
-  <div class="msg-panel">
+  <div class="msg-panel" :class="{ 'msg-panel-static': isStatic }">
     <div v-if="!conversation" class="msg-empty">
       <div class="msg-empty-icon">💬</div>
       <div>选择一个会话查看聊天记录</div>
     </div>
     <template v-else>
-      <div class="msg-header">
+      <div class="msg-header" v-if="!isStatic">
         <h3>{{ conversation.name || '未命名' }}</h3>
         <span class="msg-total">{{ total }} 条消息</span>
         <button v-if="!selfUid && senders.length === 2" class="msg-pick-self" @click="showPicker = true">
@@ -15,6 +15,8 @@
           我: {{ selfUid.slice(-4) }}
         </button>
       </div>
+
+      <div v-if="referenceError" role="status" class="msg-loading" @click="referenceError = ''">{{ referenceError }}</div>
 
       <!-- UID 选择弹窗 -->
       <div v-if="showPicker" class="picker-overlay" @click.self="showPicker = false">
@@ -35,32 +37,35 @@
         </div>
       </div>
 
-      <button v-if="hasMore && atLatest" class="msg-jump-fab msg-jump-top" @click="jumpToTop">
+      <button v-if="!isStatic && hasOlder" class="msg-jump-fab msg-jump-top" @click="jumpToTop">
         ↑ 最早消息
       </button>
-      <button v-if="!atLatest" class="msg-jump-fab msg-jump-bottom" @click="jumpToBottom">
+      <button v-if="!isStatic && hasNewer" class="msg-jump-fab msg-jump-bottom" @click="jumpToBottom">
         ↓ 最新消息
       </button>
-      <div class="msg-list" ref="listRef">
+      <div class="msg-list" :class="{ 'msg-list-static': isStatic }" ref="listRef">
         <div v-if="loading" class="msg-loading">加载中...</div>
-        <div v-if="hasMore && !loading && atLatest" class="msg-load-more" @click="loadMore">
+        <div v-else-if="loadError" role="alert" class="msg-loading">
+          {{ loadError }} <button @click="fetchMessages(conversation.conv_id)">重试</button>
+        </div>
+        <div v-if="hasOlder && !loading" class="msg-load-more" @click="loadOlder">
           ⬆ 加载更早消息
         </div>
         <template v-for="(msg, index) in messages" :key="msg.msg_id">
         <div
-          v-if="shouldShow(msg)"
+          v-if="shouldShow(msg) && !duplicateSystemIds.has(msg.msg_id)"
           class="msg-item"
           :data-msgid="msg.msg_id"
           :class="{
             'msg-self': isSelf(msg),
-            'msg-system': (msg.msg_type === 0 && !isVoiceMsg(msg)) || isJsonSystemMsg(msg),
+            'msg-system': isSystemMsg(msg),
             'msg-highlight': highlightMsgId === msg.msg_id,
             'group-start': isGroupStart(index),
             'msg-grouped': !isGroupStart(index),
           }"
         >
           <!-- 系统消息居中显示 -->
-          <template v-if="(msg.msg_type === 0 && !isVoiceMsg(msg)) || isJsonSystemMsg(msg)">
+          <template v-if="isSystemMsg(msg)">
             <div class="msg-system-block">
               <!-- 一起看视频邀请卡片 (aweType=9000) -->
               <div v-if="getWatchTogether(msg)" class="msg-watch-card">
@@ -70,12 +75,12 @@
                   <div v-if="getWatchTogether(msg).subtitle" class="msg-watch-sub">{{ getWatchTogether(msg).subtitle }}</div>
                 </div>
               </div>
-              <div v-else class="msg-system-text" @contextmenu="selectSystemContent">{{ renderSystemMsg(msg) }}</div>
+              <div v-else class="msg-system-text" @contextmenu="selectSystemContent">{{ renderSystemMsg(msg, selfUid) }}</div>
               <!-- 引用的分享视频卡片 -->
               <div
                 v-if="sysRefCache[msg.msg_id]"
                 class="msg-system-ref"
-                @click="openVideoById(sysRefCache[msg.msg_id].itemId)"
+                @click="openSystemReference(msg)"
               >
                 <img
                   v-if="sysRefCache[msg.msg_id].cover"
@@ -100,12 +105,24 @@
                 <span v-if="getRefNickname(getRefMsg(msg))" class="msg-ref-name">{{ getRefNickname(getRefMsg(msg)) }}：</span>
                 <span class="msg-ref-content">{{ getRefContent(getRefMsg(msg)) }}</span>
               </div>
-              <!-- 表情包 -->
-              <div v-if="msg.msg_type === 2 && getEmojiSrc(msg)" class="msg-media">
-                <img :src="getEmojiSrc(msg)" :alt="msg.content" loading="lazy" @click="openLightbox(getEmojiSrc(msg))" @error="onImgError" />
+              <a v-if="getProfileCard(msg)" class="msg-profile-card" :href="getProfileCard(msg).url" target="_blank" rel="noopener noreferrer">
+                <img v-if="getProfileCard(msg).avatar" :src="getProfileCard(msg).avatar" alt="用户头像" :loading="imgLoading" @error="onImgError" />
+                <div><strong>{{ getProfileCard(msg).name }}</strong>
+                  <div v-if="getProfileCard(msg).description">抖音号：{{ getProfileCard(msg).description }}</div>
+                  <div v-if="getProfileCard(msg).followers !== null">粉丝：{{ getProfileCard(msg).followers }}</div>
+                  <small>用户名片 · 查看主页</small>
+                </div>
+              </a>
+              <ForwardRecords v-else-if="getForwardInfo(msg)" :message="msg" :selfUid="selfUid" />
+              <!-- 表情包（含 type=0 的 515/517/520 漏网） -->
+              <div v-else-if="(msg.msg_type === 2 || isLooseEmoji(msg)) && getEmojiSrc(msg)" class="msg-media">
+                <img :src="getEmojiSrc(msg)" :alt="msg.content" :loading="imgLoading" @click="openLightbox(getEmojiSrc(msg))" @error="onImgError" />
+              </div>
+              <div v-else-if="isLooseEmoji(msg)" class="msg-media">
+                <div class="msg-media-missing">[表情]</div>
               </div>
               <!-- 图片/视频：优先本地原文件，回退到 inline_pic 缩略图 -->
-              <div v-else-if="msg.msg_type === 3" class="msg-media">
+              <div v-else-if="msg.msg_type === 3 || isLooseImage(msg)" class="msg-media">
                 <video
                   v-if="isVideoMsg(msg)"
                   :src="'/media/' + msg.media_local_path"
@@ -117,16 +134,20 @@
                   v-else-if="getImageSrc(msg)"
                   :src="getImageSrc(msg)"
                   alt="图片"
-                  loading="lazy"
+                  :loading="imgLoading"
                   @click="openLightbox(getImageSrc(msg))"
                 />
                 <div v-else class="msg-media-missing">[图片已失效]</div>
               </div>
-              <!-- 分享卡片 -->
-              <div v-else-if="msg.msg_type === 4" class="msg-share-card" @click="openShare(msg)">
+              <!-- 分享卡片（含 type=0/1 漏网的作品/地点/直播卡） -->
+              <div
+                v-else-if="isShareCard(msg)"
+                class="msg-share-card"
+                @click="openShare(msg)"
+              >
                 <div v-if="getShareInfo(msg).comment || getShareInfo(msg).commentImg" class="msg-share-comment">
                   <span v-if="getShareInfo(msg).commentUser" class="msg-share-comment-user">{{ getShareInfo(msg).commentUser }}：</span>{{ getShareInfo(msg).comment }}
-                  <img v-if="getShareInfo(msg).commentImg" :src="getShareInfo(msg).commentImg" class="msg-share-comment-img" loading="lazy" @error="onImgError" />
+                  <img v-if="getShareInfo(msg).commentImg" :src="getShareInfo(msg).commentImg" class="msg-share-comment-img" :loading="imgLoading" @error="onImgError" />
                 </div>
                 <div class="msg-share-card-inner">
                   <div class="msg-share-card-body">
@@ -139,7 +160,7 @@
                     v-if="getShareInfo(msg).cover"
                     :src="getShareInfo(msg).cover"
                     class="msg-share-card-cover"
-                    loading="lazy"
+                    :loading="imgLoading"
                     @error="onImgError"
                   />
                 </div>
@@ -158,7 +179,7 @@
                   <img
                     v-if="getVideoPoster(msg)"
                     :src="getVideoPoster(msg)"
-                    loading="lazy"
+                    :loading="imgLoading"
                     @click="openLightbox(getVideoPoster(msg))"
                   />
                   <div v-else class="msg-media-missing">[视频]</div>
@@ -168,40 +189,42 @@
                   </div>
                 </template>
               </div>
-              <!-- msg_type=1 但实际是贴纸/表情 JSON -->
-              <div v-else-if="isJsonSticker(msg)" class="msg-media">
-                <img v-if="getStickerUrl(msg)" :src="getStickerUrl(msg)" loading="lazy" @error="onImgError" />
-                <div v-else class="msg-media-missing">[贴纸]</div>
-              </div>
-              <!-- msg_type=1 但实际是分享卡片（JSON content 含 content_title） -->
-              <div v-else-if="isJsonShare(msg)" class="msg-share-card" @click="openShare(msg)">
-                <div v-if="getShareInfo(msg).comment || getShareInfo(msg).commentImg" class="msg-share-comment">
-                  <span v-if="getShareInfo(msg).commentUser" class="msg-share-comment-user">{{ getShareInfo(msg).commentUser }}：</span>{{ getShareInfo(msg).comment }}
-                  <img v-if="getShareInfo(msg).commentImg" :src="getShareInfo(msg).commentImg" class="msg-share-comment-img" loading="lazy" @error="onImgError" />
-                </div>
-                <div class="msg-share-card-inner">
-                  <div class="msg-share-card-body">
-                    <div class="msg-share-card-title">{{ getShareInfo(msg).title || '[分享]' }}</div>
-                    <div v-if="getShareInfo(msg).author" class="msg-share-card-author">
-                      @ {{ getShareInfo(msg).author }}
-                    </div>
-                  </div>
-                  <img
-                    v-if="getShareInfo(msg).cover"
-                    :src="getShareInfo(msg).cover"
-                    class="msg-share-card-cover"
-                    loading="lazy"
-                    @error="onImgError"
-                  />
-                </div>
-              </div>
               <!-- 语音消息 -->
-              <div v-else-if="isVoiceMsg(msg)" class="msg-voice">
-                <audio controls preload="none" :src="getVoiceUrl(msg)"></audio>
-                <span class="msg-voice-dur">{{ getVoiceDuration(msg) }}″</span>
+              <div v-else-if="isVoiceMsg(msg)" class="msg-bubble msg-voice-bubble">
+                <div class="msg-voice-player" :class="{ playing: isVoicePlaying(msg) }">
+                  <button
+                    type="button"
+                    class="msg-voice-play"
+                    :class="{ playing: isVoicePlaying(msg) }"
+                    :disabled="!getVoiceUrl(msg)"
+                    :aria-label="isVoicePlaying(msg) ? '暂停语音' : '播放语音'"
+                    @click.stop="toggleVoice(msg)"
+                  >
+                    <svg v-if="!isVoicePlaying(msg)" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M8 5.2v13.6a1 1 0 0 0 1.55.83l9.25-6.8a1 1 0 0 0 0-1.66l-9.25-6.8A1 1 0 0 0 8 5.2Z" />
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M7 5.5h3.4v13H7v-13Zm6.6 0H17v13h-3.4v-13Z" />
+                    </svg>
+                  </button>
+                  <span class="msg-voice-wave" aria-hidden="true">
+                    <i v-for="n in 13" :key="n"></i>
+                  </span>
+                  <span class="msg-voice-dur">{{ getVoiceDuration(msg) }}″</span>
+                  <audio
+                    :ref="el => setVoiceAudioRef(msg.msg_id, el)"
+                    preload="none"
+                    :src="getVoiceUrl(msg)"
+                    @ended="onVoiceEnded(msg.msg_id)"
+                  ></audio>
+                </div>
+                <div v-if="msg.voice_transcription" class="msg-voice-divider"></div>
+                <div v-if="msg.voice_transcription" class="msg-voice-transcript">
+                  <span v-html="highlightText(msg.voice_transcription)"></span>
+                </div>
               </div>
               <!-- 评论引用视频（aweType=700，文本+关联视频） -->
-              <div v-else-if="isVideoComment(msg)" class="msg-share-card" @click="openShare(msg)">
+              <div v-else-if="isVideoComment(msg)" class="msg-share-card" @click="openVideoReference(msg)">
                 <div class="msg-share-comment" v-html="highlightText(msg.content)"></div>
                 <div class="msg-share-card-inner msg-share-card-ref">
                   <span class="msg-share-card-ref-icon">▶</span>
@@ -218,10 +241,10 @@
           </template>
         </div>
         </template>
-        <div v-if="hasMore && !loading && !atLatest" class="msg-load-more" @click="loadMore">
+        <div v-if="hasNewer && !loading" class="msg-load-more" @click="loadNewer">
           ⬇ 加载更新消息
         </div>
-        <div v-if="messages.length === 0 && !loading" class="msg-no-data">
+        <div v-if="messages.length === 0 && !loading && !loadError" class="msg-no-data">
           暂无消息
         </div>
       </div>
@@ -232,39 +255,85 @@
 </template>
 
 <script setup>
-import { ref, reactive, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { highlightText as _highlightText } from '@/lib/highlight'
 import { resolveAvatarUrl } from '@/lib/media'
 import MessageLightbox from './MessageLightbox.vue'
 import {
   clearCjCache, getContentJson, tryParseJson, tryParseShareContent, extractShareTitle,
-  isJsonSystemMsg, isJsonSticker, getStickerUrl, shouldShow, renderSystemMsg, getWatchTogether,
-  extractServerMsgIds, isVideoComment, isJsonShare, getShareInfo, getInlinePic,
+  isJsonSystemMsg, shouldShow, renderSystemMsg, getWatchTogether, getProfileCard, getForwardInfo, isSystemMsg, duplicateSystemMessageIds,
+  extractServerMsgIds, isVideoComment, isLooseEmoji, isLooseImage, isShareCard, getShareInfo, getInlinePic,
   isVideoMsg, hasLocalVideo, isJsonVideo, getVideoPoster, getVideoDuration,
   getImageSrc, getEmojiSrc, isRecalled, isVoiceMsg, getVoiceUrl, getVoiceDuration,
   getRefMsg, getRefContent, getRefNickname,
 } from '@/lib/douyinMessage'
 
+import ForwardRecords from './ForwardRecords.vue'
+
 const props = defineProps({
   conversation: Object,
   searchHighlight: String,
   jumpToSeq: Number,
+  // 截图模式：只加载 [startSeq, endSeq] 区间，隐藏交互 chrome，不绑定滚动
+  staticRange: Object,
+  embeddedMessages: Array,
+  selfUidOverride: String,
 })
-const emit = defineEmits(['jumped'])
+const emit = defineEmits(['jumped', 'staticLoaded'])
 
 const messages = ref([])
 const total = ref(0)
 const loading = ref(false)
 let scrollLocked = false  // 防止程序化滚动触发无限加载
-const hasMore = ref(false)
-const atLatest = ref(true)  // 当前是否在查看最新消息
+const hasOlder = ref(false)
+const hasNewer = ref(false)
 const listRef = ref(null)
 const senders = ref([])
-const selfUid = ref(localStorage.getItem('selfUid') || '')
+const selfUid = ref(props.selfUidOverride || localStorage.getItem('selfUid') || '')
 const showPicker = ref(false)
+const isStatic = computed(() => !!props.staticRange || !!props.embeddedMessages)
+const duplicateSystemIds = computed(() => duplicateSystemMessageIds(messages.value))
+const imgLoading = computed(() => (isStatic.value ? 'eager' : 'lazy'))
 
 // 用户信息缓存 { uid: { nickname, avatar_url, unique_id } }
 const userCache = reactive({})
+
+// Keep native audio elements behind the compact voice bubble and allow only
+// one voice message to play at a time.
+const voiceAudioRefs = new Map()
+const playingVoiceId = ref(null)
+
+function setVoiceAudioRef(msgId, el) {
+  if (el) voiceAudioRefs.set(msgId, el)
+  else voiceAudioRefs.delete(msgId)
+}
+
+function isVoicePlaying(msg) {
+  return playingVoiceId.value === msg.msg_id
+}
+
+async function toggleVoice(msg) {
+  const audio = voiceAudioRefs.get(msg.msg_id)
+  if (!audio || !getVoiceUrl(msg)) return
+  if (!audio.paused) {
+    audio.pause()
+    playingVoiceId.value = null
+    return
+  }
+  for (const [msgId, other] of voiceAudioRefs) {
+    if (msgId !== msg.msg_id && !other.paused) other.pause()
+  }
+  try {
+    await audio.play()
+    playingVoiceId.value = msg.msg_id
+  } catch {
+    playingVoiceId.value = null
+  }
+}
+
+function onVoiceEnded(msgId) {
+  if (playingVoiceId.value === msgId) playingVoiceId.value = null
+}
 
 // content_json 解析缓存
 // 系统消息引用的分享视频缓存 { msg_id: { title, cover, itemId } }
@@ -276,7 +345,7 @@ function isSelf(msg) {
 }
 
 function _isSystem(msg) {
-  return (msg.msg_type === 0 && !isVoiceMsg(msg)) || isJsonSystemMsg(msg)
+  return isSystemMsg(msg)
 }
 
 // A message starts a new visual group unless it continues the previous
@@ -291,6 +360,12 @@ function isGroupStart(index) {
   return Math.abs((cur.timestamp || 0) - (prev.timestamp || 0)) > 300  // >5 min
 }
 
+// 单聊的 conv_id 形如 "0:1:uidA:uidB"，群聊是纯数字雪花 ID。
+const isGroupConv = computed(() => {
+  const id = props.conversation?.conv_id || ''
+  return !!id && !id.includes(':')
+})
+
 function displayName(msg) {
   if (selfUid.value && msg.sender_uid === selfUid.value) {
     const u = userCache[msg.sender_uid]
@@ -299,6 +374,11 @@ function displayName(msg) {
   const u = userCache[msg.sender_uid]
   if (u?.nickname) return u.nickname
   if (msg.sender_name && msg.sender_name !== '__self__') return msg.sender_name
+  // 群聊里回退成会话名 = 把每个不认识的成员都显示成群名，不同的人会糊成同一个。
+  // 单聊没这个问题（会话名就是对方昵称）。
+  if (props.embeddedMessages || isGroupConv.value) {
+    return msg.sender_uid ? `用户${msg.sender_uid.slice(-6)}` : '群成员'
+  }
   return props.conversation?.name || '对方'
 }
 
@@ -348,7 +428,7 @@ async function loadSysRefs(msgList) {
         const refMsg = await res.json()
         const info = getShareInfo(refMsg)
         if (info.title || info.cover) {
-          sysRefCache[msg.msg_id] = info
+          sysRefCache[msg.msg_id] = { ...info, serverId: smid }
           break
         }
       } catch {}
@@ -356,8 +436,27 @@ async function loadSysRefs(msgList) {
   }
 }
 
-function openVideoById(itemId) {
-  if (itemId) window.open(`https://www.douyin.com/video/${itemId}`, '_blank')
+function openSystemReference(msg) {
+  const target = sysRefCache[msg.msg_id]
+  if (props.embeddedMessages) {
+    if (target?.itemId) window.open(`https://www.douyin.com/video/${target.itemId}`, '_blank')
+  } else if (target?.serverId) jumpToRefMsg({ server_id: target.serverId })
+}
+
+async function openVideoReference(msg) {
+  if (props.embeddedMessages) return openShare(msg)
+  const ref = getRefMsg(msg)
+  if (ref?.server_id) return jumpToRefMsg(ref)
+  const convId = props.conversation?.conv_id
+  try {
+    const res = await fetch(`/api/messages/${encodeURIComponent(msg.msg_id)}/referenced-video`)
+    if (!res.ok) throw new Error()
+    const target = await res.json()
+    if (props.conversation?.conv_id !== convId) return
+    return jumpToRefMsg({ server_id: target.msg_id.replace(/^srv_/, '') })
+  } catch {
+    if (props.conversation?.conv_id === convId) referenceError.value = '引用的消息未归档，无法定位'
+  }
 }
 
 // 右键消息体 → 全选其内容（让浏览器原生右键菜单的"复制"直接生效）
@@ -366,7 +465,7 @@ function selectMsgContent(e) {
   if (!body) return
   // 优先精确选中消息内容容器（避开 sender / time）
   const content = body.querySelector(
-    ':scope > .msg-bubble, :scope > .msg-share-card, :scope > .msg-share-comment, :scope > .msg-media, :scope > .msg-voice'
+  ':scope > .msg-bubble, :scope > .msg-share-card, :scope > .msg-share-comment, :scope > .msg-media'
   )
   const target = content || body
   const range = document.createRange()
@@ -392,6 +491,9 @@ function selectSystemContent(e) {
 const highlightMsgId = ref(null)
 
 // Lightbox state (the overlay + ESC handling live in MessageLightbox)
+const loadError = ref('')
+const referenceError = ref('')
+let messageRequestId = 0
 const lightboxSrc = ref(null)
 function openLightbox(src) {
   if (src) lightboxSrc.value = src
@@ -399,7 +501,11 @@ function openLightbox(src) {
 
 async function jumpToRefMsg(ref) {
   if (!ref || !ref.server_id || !props.conversation) return
-  const msgId = `srv_${ref.server_id}`
+  referenceError.value = ''
+  const convId = props.conversation.conv_id
+  const canonicalId = `srv_${ref.server_id}`
+  const embedded = props.embeddedMessages?.find(m => m.msg_id === canonicalId || m.msg_id.endsWith('/' + canonicalId))
+  const msgId = embedded?.msg_id || canonicalId
   // 锁定滚动，防止无限加载干扰
   scrollLocked = true
   try {
@@ -411,23 +517,29 @@ async function jumpToRefMsg(ref) {
       setTimeout(() => { highlightMsgId.value = null }, 2000)
       return
     }
+    if (isStatic.value) {
+      referenceError.value = '引用的消息不在当前记录中'
+      return
+    }
     // 需要加载目标消息附近的消息
     const res = await fetch(`/api/messages/${msgId}`)
-    if (!res.ok) return
+    if (!res.ok) throw new Error()
     const msg = await res.json()
-    if (!msg.seq) return
+    if (props.conversation?.conv_id !== convId) return
+    if (msg.conv_id !== convId || !msg.seq) throw new Error()
     const targetSeq = Math.max(0, msg.seq - 50)
-    messages.value = []
-    clearCjCache()
     loading.value = true
     const url = `/api/conversations/${props.conversation.conv_id}/messages?page_size=100&after_seq=${targetSeq}`
     const res2 = await fetch(url)
+    if (!res2.ok) throw new Error()
     const data = await res2.json()
+    if (props.conversation?.conv_id !== convId) return
+    clearCjCache()
     loading.value = false
     messages.value = data.items
     total.value = data.total
-    hasMore.value = messages.value.length < data.total
-    atLatest.value = false
+    hasOlder.value = data.has_older ?? true
+    hasNewer.value = data.has_newer ?? true
     loadUserInfoForMessages(data.items)
     loadSysRefs(data.items)
     await nextTick()
@@ -437,7 +549,10 @@ async function jumpToRefMsg(ref) {
       highlightMsgId.value = msgId
       setTimeout(() => { highlightMsgId.value = null }, 2000)
     }
-  } catch {} finally {
+  } catch {
+    referenceError.value = '引用的消息未归档或加载失败，无法定位'
+  } finally {
+    loading.value = false
     setTimeout(() => { scrollLocked = false }, 300)
   }
 }
@@ -463,8 +578,10 @@ async function fetchSenders(convId) {
   } catch {}
 }
 
-async function fetchMessages(convId, beforeSeq = null, afterSeq = null) {
+async function fetchMessages(convId, beforeSeq = null, afterSeq = null, replace = false) {
+  const requestId = ++messageRequestId
   loading.value = true
+  loadError.value = ''
   let url = `/api/conversations/${convId}/messages?page_size=100`
   if (beforeSeq !== null) url += `&before_seq=${beforeSeq}`
   if (afterSeq !== null) url += `&after_seq=${afterSeq}`
@@ -473,7 +590,11 @@ async function fetchMessages(convId, beforeSeq = null, afterSeq = null) {
     const res = await fetch(url)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     data = await res.json()
+    if (requestId !== messageRequestId || props.conversation?.conv_id !== convId) return
+    if (!Array.isArray(data.items)) throw new Error('消息响应格式错误')
   } catch (e) {
+    if (requestId !== messageRequestId || props.conversation?.conv_id !== convId) return
+    loadError.value = `消息加载失败（${e.message}），请重试；持续失败请查看服务端日志`
     // Don't leave the spinner (and scroll lock) stuck forever on a failed load.
     loading.value = false
     scrollLocked = false
@@ -489,58 +610,80 @@ async function fetchMessages(convId, beforeSeq = null, afterSeq = null) {
   if (beforeSeq === null && afterSeq === null) {
     // 初始加载（最新消息）
     messages.value = data.items
-    atLatest.value = true
+    hasOlder.value = !!data.has_older
+    hasNewer.value = !!data.has_newer
     await nextTick()
     if (listRef.value) listRef.value.scrollTop = listRef.value.scrollHeight
-  } else if (afterSeq !== null && afterSeq === 0) {
-    // 跳到最早消息
+  } else if (replace) {
+    // 从搜索、日期或引用结果跳入会话中间；页面两侧都可能还有消息。
     messages.value = data.items
-    atLatest.value = false
+    hasOlder.value = !!data.has_older
+    hasNewer.value = !!data.has_newer
     await nextTick()
-    if (listRef.value) listRef.value.scrollTop = 0
+    if (afterSeq === 0 && listRef.value) listRef.value.scrollTop = 0
   } else if (afterSeq !== null) {
-    // 向下加载更新的消息（从最早端向下加载更多）
+    // 向下加载更新的消息。
     messages.value = [...messages.value, ...data.items]
-    // 如果没有更多新消息了，说明已到达最新
-    if (data.items.length === 0 || messages.value.length >= data.total) {
-      atLatest.value = true
-    }
+    hasNewer.value = data.items.length > 0 && !!data.has_newer
   } else {
     // 加载更早的消息（向上加载更多）
     const list = listRef.value
     const prevHeight = list ? list.scrollHeight : 0
     messages.value = [...data.items, ...messages.value]
+    hasOlder.value = data.items.length > 0 && !!data.has_older
     await nextTick()
     if (list) list.scrollTop = list.scrollHeight - prevHeight
   }
   setTimeout(() => { scrollLocked = false }, 200)
 
   total.value = data.total
-  hasMore.value = messages.value.length < data.total
-
   // 异步加载用户信息（头像、昵称）
   loadUserInfoForMessages(data.items)
   // 异步加载系统消息引用的视频
   loadSysRefs(data.items)
 }
 
-function loadMore() {
-  if (props.conversation && messages.value.length > 0) {
-    if (atLatest.value) {
-      // 在最新端：向上加载更早的消息
-      const minSeq = Math.min(...messages.value.map(m => m.seq))
-      fetchMessages(props.conversation.conv_id, minSeq)
-    } else {
-      // 在最早端（跳转到顶部后）：向下加载更新的消息
-      const maxSeq = Math.max(...messages.value.map(m => m.seq))
-      fetchMessages(props.conversation.conv_id, null, maxSeq)
-    }
+function loadOlder() {
+  if (!props.conversation || !messages.value.length || !hasOlder.value || loading.value) return
+  const minSeq = Math.min(...messages.value.map(m => m.seq))
+  fetchMessages(props.conversation.conv_id, minSeq)
+}
+
+function loadNewer() {
+  if (!props.conversation || !messages.value.length || !hasNewer.value || loading.value) return
+  const maxSeq = Math.max(...messages.value.map(m => m.seq))
+  fetchMessages(props.conversation.conv_id, null, maxSeq)
+}
+
+// 截图模式：一次性加载闭区间消息，等用户信息与引用卡片就绪后通知父组件
+async function fetchStaticRange(convId) {
+  loading.value = true
+  try {
+    const { startSeq, endSeq } = props.staticRange
+    const res = await fetch(
+      `/api/conversations/${convId}/messages/range?start_seq=${startSeq}&end_seq=${endSeq}`
+    )
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    clearCjCache()
+    messages.value = data.items
+    total.value = data.total
+    hasOlder.value = false
+    hasNewer.value = false
+    await loadUserInfoForMessages(data.items)
+    await loadSysRefs(data.items)
+  } catch (e) {
+    console.error('加载消息失败', e)
+  } finally {
+    loading.value = false
   }
+  await nextTick()
+  emit('staticLoaded')
 }
 
 async function jumpToTop() {
   if (!props.conversation) return
-  await fetchMessages(props.conversation.conv_id, null, 0)
+  await fetchMessages(props.conversation.conv_id, null, 0, true)
 }
 
 async function jumpToBottom() {
@@ -554,28 +697,25 @@ let scrollDebounce = null
 function onListScroll() {
   if (scrollDebounce || scrollLocked) return
   const list = listRef.value
-  if (!list || loading.value || !hasMore.value) return
+  if (!list || loading.value) return
   if (!props.conversation) return  // scroll event after the conversation was cleared
   const threshold = 100
   // 滚到顶部附近 → 加载更早消息
-  if (list.scrollTop < threshold) {
-    const minSeq = Math.min(...messages.value.map(m => m.seq))
-    if (minSeq > 1) {
-      scrollDebounce = true
-      fetchMessages(props.conversation.conv_id, minSeq)
-      setTimeout(() => { scrollDebounce = false }, 500)
-    }
-  }
-  // 滚到底部附近 → 加载更新消息
-  if (list.scrollHeight - list.scrollTop - list.clientHeight < threshold && !atLatest.value) {
+  if (list.scrollTop < threshold && hasOlder.value) {
     scrollDebounce = true
-    const maxSeq = Math.max(...messages.value.map(m => m.seq))
-    fetchMessages(props.conversation.conv_id, null, maxSeq)
+    loadOlder()
+    setTimeout(() => { scrollDebounce = false }, 500)
+  }
+  // 滚到底部附近 → 加载更新消息。
+  if (list.scrollHeight - list.scrollTop - list.clientHeight < threshold && hasNewer.value) {
+    scrollDebounce = true
+    loadNewer()
     setTimeout(() => { scrollDebounce = false }, 500)
   }
 }
 
 onMounted(() => {
+  if (isStatic.value) return
   // 延迟绑定，等 listRef 准备好
   const tryBind = () => {
     if (listRef.value) {
@@ -590,6 +730,9 @@ onUnmounted(() => {
   if (listRef.value) {
     listRef.value.removeEventListener('scroll', onListScroll)
   }
+  for (const audio of voiceAudioRefs.values()) audio.pause()
+  voiceAudioRefs.clear()
+  playingVoiceId.value = null
 })
 
 function formatTime(ts) {
@@ -612,23 +755,44 @@ function onImgError(e) {
 }
 
 watch(() => props.conversation, (conv) => {
+  referenceError.value = ''
+  loadError.value = ''
+  messageRequestId++
+  if (props.embeddedMessages) return
   if (conv) {
     messages.value = []
+    hasOlder.value = false
+    hasNewer.value = false
     clearCjCache()
+    if (isStatic.value) {
+      fetchStaticRange(conv.conv_id)
+      return
+    }
     fetchSenders(conv.conv_id)
     // 如果有 jumpToSeq，由 jumpToSeq watcher 处理加载
     if (!props.jumpToSeq) {
       fetchMessages(conv.conv_id)
     }
   }
-})
+}, { immediate: true })
+
+watch(() => props.embeddedMessages, (items) => {
+  if (!items) return
+  messages.value = items
+  total.value = items.length
+  hasOlder.value = false
+  hasNewer.value = false
+  loadUserInfoForMessages(items)
+}, { immediate: true })
+
+watch(() => props.selfUidOverride, (uid) => { selfUid.value = uid || '' })
 
 watch(() => props.jumpToSeq, async (seq) => {
   if (seq && props.conversation) {
     messages.value = []
     clearCjCache()
     const targetSeq = Math.max(0, seq - 50)
-    await fetchMessages(props.conversation.conv_id, null, targetSeq)
+    await fetchMessages(props.conversation.conv_id, null, targetSeq, true)
     await nextTick()
     // 精确滚动到目标消息并高亮
     const targetMsg = messages.value.find(m => m.seq === seq)
@@ -646,6 +810,11 @@ watch(() => props.jumpToSeq, async (seq) => {
 </script>
 
 <style scoped>
+.msg-profile-card { display: flex; align-items: center; gap: 12px; width: 280px; max-width: 100%; padding: 14px; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: var(--radius); text-decoration: none; }
+.msg-profile-card img { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; }
+.msg-profile-card strong { font-size: 15px; }
+.msg-profile-card div div, .msg-profile-card small { font-size: 12px; color: var(--text-secondary); margin-top: 5px; }
+
 .msg-panel {
   display: flex;
   flex-direction: column;
@@ -759,6 +928,18 @@ watch(() => props.jumpToSeq, async (seq) => {
   padding: 16px 20px 32px;
 }
 
+/* 截图模式：容器随内容自然撑开，不滚动，供整页截图 */
+.msg-panel-static {
+  flex: none;
+  min-height: auto;
+  height: auto;
+}
+.msg-list-static {
+  flex: none;
+  overflow: visible;
+  height: auto;
+}
+
 .msg-loading, .msg-no-data {
   text-align: center;
   color: var(--text-muted);
@@ -780,7 +961,7 @@ watch(() => props.jumpToSeq, async (seq) => {
 }
 
 .msg-jump-fab {
-  position: fixed;
+  position: absolute;
   right: 32px;
   z-index: 100;
   padding: 8px 18px;
@@ -893,11 +1074,12 @@ watch(() => props.jumpToSeq, async (seq) => {
 .msg-item.group-start {
   margin-top: 14px;
 }
+/* Target only this row: forwarded dialogs contain another MessageList. */
 /* continuation messages hide the repeated avatar + name and sit tight */
-.msg-item.msg-grouped .msg-avatar {
+.msg-item.msg-grouped > .msg-avatar {
   visibility: hidden;
 }
-.msg-item.msg-grouped .msg-sender {
+.msg-item.msg-grouped > .msg-body > .msg-sender {
   display: none;
 }
 .msg-item.msg-highlight {
@@ -951,7 +1133,7 @@ watch(() => props.jumpToSeq, async (seq) => {
   color: var(--text-muted);
   margin-bottom: 3px;
 }
-.msg-item.msg-self .msg-sender {
+.msg-item.msg-self > .msg-body > .msg-sender {
   text-align: right;
 }
 
@@ -967,7 +1149,7 @@ watch(() => props.jumpToSeq, async (seq) => {
   box-shadow: var(--shadow-sm);
   border: 1px solid color-mix(in srgb, var(--text-primary) 5%, transparent);
 }
-.msg-item.msg-self .msg-bubble {
+.msg-item.msg-self > .msg-body > .msg-bubble {
   background: var(--bg-message-self);
   color: var(--text-on-self);
   border: none;
@@ -1013,7 +1195,7 @@ watch(() => props.jumpToSeq, async (seq) => {
 .msg-share-card:hover {
   filter: brightness(1.1);
 }
-.msg-item.msg-self .msg-share-card {
+.msg-item.msg-self > .msg-body > .msg-share-card {
   background: var(--bg-message-self);
   border-top-left-radius: 10px;
   border-top-right-radius: 2px;
@@ -1087,21 +1269,129 @@ watch(() => props.jumpToSeq, async (seq) => {
   opacity: 0.85;
 }
 
-/* 语音消息 */
-.msg-voice {
+/* 语音消息：沿用普通消息气泡，并在播放器与转写之间分隔 */
+.msg-voice-bubble {
+  min-width: 176px;
+  max-width: 360px;
+  padding: 8px 10px 9px;
+}
+.msg-voice-player {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
+  min-height: 32px;
 }
-.msg-voice audio {
-  height: 36px;
-  max-width: 260px;
+.msg-voice-play {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--text-primary);
+  color: var(--bg-primary);
+  box-shadow: none;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: transform 0.15s, opacity 0.15s;
+}
+.msg-voice-play svg { width: 16px; height: 16px; fill: currentColor; }
+.msg-voice-play:hover:not(:disabled),
+.msg-voice-play.playing {
+  transform: scale(1.03);
+  opacity: 0.78;
+}
+.msg-item.msg-self > .msg-body > .msg-voice-bubble .msg-voice-play {
+  background: color-mix(in srgb, var(--text-on-self) 94%, transparent);
+  color: var(--accent);
+}
+.msg-item.msg-self > .msg-body > .msg-voice-bubble .msg-voice-play:hover:not(:disabled),
+.msg-item.msg-self > .msg-body > .msg-voice-bubble .msg-voice-play.playing {
+  opacity: 0.8;
+}
+.msg-voice-play:disabled {
+  opacity: 0.45;
+  cursor: default;
+  box-shadow: none;
+}
+.msg-voice-play:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.msg-voice-wave {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 22px;
+  flex: 0 0 auto;
+}
+.msg-voice-wave i {
+  display: block;
+  width: 2.5px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--text-primary);
+  opacity: 0.88;
+  transform-origin: center;
+  transition: opacity 0.2s, background 0.2s;
+}
+.msg-voice-wave i:nth-child(1) { height: 8px; }
+.msg-voice-wave i:nth-child(2) { height: 14px; }
+.msg-voice-wave i:nth-child(3) { height: 11px; }
+.msg-voice-wave i:nth-child(4) { height: 16px; }
+.msg-voice-wave i:nth-child(5) { height: 10px; }
+.msg-voice-wave i:nth-child(6) { height: 18px; }
+.msg-voice-wave i:nth-child(7) { height: 12px; }
+.msg-voice-wave i:nth-child(8) { height: 21px; }
+.msg-voice-wave i:nth-child(9) { height: 14px; }
+.msg-voice-wave i:nth-child(10) { height: 9px; }
+.msg-voice-wave i:nth-child(11) { height: 17px; }
+.msg-voice-wave i:nth-child(12) { height: 12px; }
+.msg-voice-wave i:nth-child(13) { height: 19px; }
+.msg-item.msg-self > .msg-body > .msg-voice-bubble .msg-voice-wave i {
+  background: color-mix(in srgb, var(--text-on-self) 90%, transparent);
+  opacity: 0.9;
+}
+@keyframes voice-wave-pulse {
+  0%, 100% { transform: scaleY(0.58); opacity: 0.58; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
+.msg-voice-player.playing .msg-voice-wave i {
+  animation: voice-wave-pulse 0.9s ease-in-out infinite alternate;
+}
+.msg-voice-player.playing .msg-voice-wave i:nth-child(2n) { animation-delay: -0.25s; }
+.msg-voice-player.playing .msg-voice-wave i:nth-child(3n) { animation-delay: -0.5s; }
+@media (prefers-reduced-motion: reduce) {
+  .msg-voice-player.playing .msg-voice-wave i { animation: none; }
+}
+.msg-voice-bubble audio {
+  display: none;
 }
 .msg-voice-dur {
+  margin-left: 4px;
   font-size: 12px;
+  font-weight: 500;
   color: var(--text-muted);
   white-space: nowrap;
+  text-align: right;
+}
+.msg-item.msg-self > .msg-body > .msg-voice-bubble .msg-voice-dur {
+  color: color-mix(in srgb, var(--text-on-self) 76%, transparent);
+}
+.msg-voice-divider {
+  border-top: 1px solid color-mix(in srgb, var(--text-primary) 16%, transparent);
+  margin: 8px 0 7px;
+}
+.msg-item.msg-self > .msg-body > .msg-voice-bubble .msg-voice-divider {
+  border-top-color: color-mix(in srgb, var(--text-on-self) 25%, transparent);
+}
+.msg-voice-transcript {
+  color: inherit;
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* 表情/图片 */
@@ -1172,7 +1462,7 @@ watch(() => props.jumpToSeq, async (seq) => {
   color: var(--text-muted);
   margin-top: 3px;
 }
-.msg-item.msg-self .msg-time {
+.msg-item.msg-self > .msg-body > .msg-time {
   text-align: right;
 }
 .msg-recalled-tag {

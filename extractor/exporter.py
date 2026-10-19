@@ -8,7 +8,9 @@ import re
 import time
 import urllib.parse
 
+from common import paths
 from extractor.models import get_db
+from backend.forwarded import as_object, resolve_forward
 
 # DB msg_type → ChatLab message type
 CHATLAB_TYPE_MAP = {
@@ -16,9 +18,63 @@ CHATLAB_TYPE_MAP = {
     2: 5,   # emoji → EMOJI
     3: 1,   # image → IMAGE
     4: 24,  # share → SHARE
-    5: 1,   # video → IMAGE (只有 poster，没有真视频流)
+    5: 0,   # video → readable duration label (analysis-oriented export)
     0: 99,  # other → OTHER
 }
+
+
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+_MAX_FILENAME_BYTES = 255
+
+
+def _safe_filename_component(
+    value: str | None,
+    fallback: str = "conversation",
+    max_bytes: int = _MAX_FILENAME_BYTES,
+) -> str:
+    """Convert a conversation nickname into a portable filename component."""
+    component = str(value or "").strip()
+    component = _INVALID_FILENAME_CHARS_RE.sub("_", component)
+    component = re.sub(r"\s+", "_", component)
+    component = component.strip(" ._") or fallback
+    if component.upper() in _WINDOWS_RESERVED_NAMES:
+        component = f"_{component}"
+    encoded = component.encode("utf-8")
+    if len(encoded) > max_bytes:
+        component = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return component.rstrip(" ._") or fallback
+
+
+def build_export_filename(
+    username: str | None,
+    output_format: str = "jsonl",
+    timestamp: int | float | None = None,
+    collision_index: int | None = None,
+) -> str:
+    """Build a recognizable, filesystem-safe ChatLab export filename.
+
+    The timestamp is the export time (local time) and includes seconds so
+    repeated exports made in different seconds do not all become browser
+    ``(1)``/``(2)`` downloads.
+    """
+    export_time = time.localtime(time.time() if timestamp is None else timestamp)
+    stamp = time.strftime("%Y%m%d%H%M%S", export_time)
+    extension = ".json" if output_format == "json" else ".jsonl"
+    collision_suffix = f"_{collision_index}" if collision_index else ""
+    suffix = f"{collision_suffix}_{stamp}_export{extension}"
+    component = _safe_filename_component(
+        username,
+        max_bytes=_MAX_FILENAME_BYTES - len(suffix.encode("utf-8")),
+    )
+    return f"{component}{suffix}"
 
 
 _STICKER_HEX_RE = re.compile(r"-ts-([0-9a-fA-F]{4,})(?:\.[a-zA-Z0-9]{1,5})?$")
@@ -200,71 +256,143 @@ def _get_content_json(msg) -> dict | None:
     if not raw:
         return None
     try:
-        raw_obj = json.loads(raw) if isinstance(raw, str) else raw
+        raw_obj = as_object(raw)
         cj_str = raw_obj.get("content_json", "")
         if cj_str:
-            return json.loads(cj_str) if isinstance(cj_str, str) else cj_str
+            return as_object(cj_str) or None
     except (json.JSONDecodeError, KeyError, TypeError):
         pass
     return None
 
 
-def _resolve_message(msg, cj: dict | None, media_dir: str) -> tuple:
+def _message_field(msg, key: str, default=None):
+    """Read a field from either sqlite3.Row or a plain test dictionary."""
+    if isinstance(msg, dict):
+        return msg.get(key, default)
+    try:
+        return msg[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _resolve_message(msg, cj: dict | None, media_dir: str, embed_images: bool = True) -> tuple:
     """Decide the ChatLab content + type for one DB message.
 
     Returns (content, chatlab_type, stats) where stats is a dict of counter
     increments ({'voice':1}, {'image':1,'image_embedded':1}, ...). The ordering
     of the voice/video/emoji/image and share/system branches is load-bearing and
     matches the original inline loop exactly (see test_exporter).
+
+    embed_images=False keeps images as a plain ``[图片]`` label (type IMAGE)
+    instead of inlining base64 data URLs — used by the ChatLab pull API where
+    payload size matters and the picture itself adds nothing to analysis.
     """
+    cj = cj if isinstance(cj, dict) else {}
     msg_type = msg["msg_type"]
-    content = msg["content"]
+    content = msg["content"] or ""
+    awe = str(cj.get("aweType", ""))
+    if cj.get("name") and (cj.get("secUID") or cj.get("sec_uid") or cj.get("uid")):
+        uid = cj.get("secUID") or cj.get("sec_uid") or cj.get("uid")
+        link = "https://www.douyin.com/user/" + urllib.parse.quote(str(uid), safe="")
+        return " | ".join(str(v) for v in ["[用户名片] " + str(cj["name"]), cj.get("desc"), link] if v), 27, {}
+    patch = as_object(as_object(cj.get("im_dynamic_patch")).get("raw_data"))
+    if awe == "11029" and patch:
+        title = as_object(patch.get("content_top")).get("content") or "商品"
+        actions = as_object(patch.get("whole_card")).get("action_info") or []
+        schema = as_object(as_object(actions[0]).get("params")).get("schema", "") if isinstance(actions, list) and actions else ""
+        match = re.search(r"commodity_id=(\d+)", str(schema))
+        link = " | https://www.douyin.com/product/" + match[1] if match else ""
+        return "[分享商品] " + str(title) + link, 24, {"share": 1}
+    if awe == "9000":
+        return _system_message_text(None, cj), 0, {"system": 1}
+    if cj.get("tips") and not cj.get("resource_url"):
+        return _system_message_text(None, cj), 0, {"system": 1}
+    if awe in {"500", "501", "507", "508", "510", "514", "516"}:
+        msg_type = 2
+        content = cj.get("display_name") or "[表情]"
+    elif awe in {"2702", "2703", "2704"}:
+        msg_type = 3
+    if cj.get("text") and (not content or content.startswith("{")):
+        content = str(cj["text"])
+
     chatlab_type = CHATLAB_TYPE_MAP.get(msg_type, 99)
     stats: dict = {}
 
     # 语音消息：msg_type=0 但有 resource_url + duration
     # 不再嵌 base64 / CDN URL —— 对 LLM 无意义且每条几百 KB；用纯文字标签即可。
     is_voice = False
-    if cj and cj.get("resource_url") and cj.get("duration"):
+    voice_resource = cj.get("resource_url") if cj else None
+    voice_duration = cj.get("duration") if cj else None
+    if voice_duration in (None, "") and isinstance(voice_resource, dict):
+        voice_duration = voice_resource.get("duration")
+    video_payload = cj.get("video") if isinstance(cj, dict) else None
+    has_video_payload = (
+        isinstance(video_payload, dict) and bool(video_payload.get("vid"))
+    )
+    is_image_payload = bool(
+        cj and str(cj.get("aweType")) in {"2702", "2703", "2704"}
+    )
+    if (
+        voice_resource is not None
+        and voice_duration not in (None, "")
+        and not has_video_payload
+        and not is_image_payload
+    ):
         is_voice = True
         chatlab_type = 0  # TEXT
-        dur_sec = round(cj["duration"] / 1000)
-        content = f"[语音 {dur_sec}秒]" if dur_sec else "[语音]"
+        try:
+            dur_sec = round(float(voice_duration) / 1000)
+        except (TypeError, ValueError):
+            dur_sec = 0
+        voice_label = f"[语音 {dur_sec}秒]" if dur_sec else "[语音]"
+        transcription = _message_field(msg, "voice_transcription", "")
+        transcription_status = _message_field(
+            msg, "voice_transcription_status", None
+        )
+        if transcription_status not in (None, "", "success"):
+            transcription = ""
+        transcription = transcription.strip() if isinstance(transcription, str) else ""
+        content = f"{voice_label} {transcription}" if transcription else voice_label
         stats["voice"] = 1
 
     # 视频消息：msg_type=5 (新分类) 或 cj.video.vid 兜底（老数据）
     is_video = False
-    if not is_voice and ((msg_type == 5) or (cj and cj.get("video", {}).get("vid"))):
+    if not is_voice and ((msg_type == 5) or has_video_payload or str(_message_field(msg, "media_local_path") or "").lower().endswith(".mp4")):
         is_video = True
         try:
             dur_sec = round(float((cj or {}).get("duration") or 0))
         except (TypeError, ValueError):
             dur_sec = 0
         content = f"[视频 {dur_sec}秒]" if dur_sec else "[视频]"
-        chatlab_type = 0  # TEXT —— ChatLab 没有 video 类型，poster 用 IMAGE 另放
+        chatlab_type = 0  # Keep the existing analysis-oriented duration label policy.
         stats["video"] = 1
 
     # 表情：用文字标签代替 URL — CDN 早晚过期，URL 对 LLM 也没意义。
     if not is_voice and not is_video and chatlab_type == 5:
         content = _emoji_text_label(content, msg["media_url"])
         stats["emoji"] = 1
-    # 图片：优先 CDN URL，本地文件 fallback 为 base64
+    # Prefer the archived plaintext image; signed origin URLs may be encrypted/expired.
+    elif not is_voice and not is_video and chatlab_type == 1 and not embed_images:
+        content = "[图片]"
+        stats["image"] = 1
     elif not is_voice and not is_video and chatlab_type == 1:
-        if msg["media_url"]:
+        local = _message_field(msg, "media_local_path")
+        full = os.path.realpath(os.path.join(media_dir, local)) if local else None
+        root = os.path.realpath(media_dir)
+        data_url = None
+        if full and os.path.commonpath([root, full]) == root:
+            data_url = _file_to_data_url(full)
+        if data_url:
+            content = data_url
+            stats["image_embedded"] = 1
+        elif cj.get("inline_pic"):
+            content = "data:image/webp;base64," + re.sub(r"\s+", "", str(cj["inline_pic"]))
+            stats["image_embedded"] = 1
+        elif msg["media_url"] and not as_object(cj.get("resource_url")).get("skey"):
             content = msg["media_url"]
-            stats["image"] = 1
-        elif msg["media_local_path"] and os.path.isfile(
-            os.path.join(media_dir, msg["media_local_path"])
-        ):
-            data_url = _file_to_data_url(
-                os.path.join(media_dir, msg["media_local_path"])
-            )
-            if data_url:
-                content = data_url
-                stats["image_embedded"] = 1
-            else:
-                chatlab_type = 0
-            stats["image"] = 1
+        else:
+            content, chatlab_type = "[图片未下载]", 0
+        stats["image"] = 1
 
     # 分享消息：以 cj 的形态判断（含 itemId），不依赖 msg_type。
     # 不要放宽到 aweType / content_title 等字段 —— 表情消息的 cj 也带这些。
@@ -280,6 +408,8 @@ def _resolve_message(msg, cj: dict | None, media_dir: str) -> tuple:
         if item_id:
             parts.append(f"https://www.douyin.com/video/{item_id}")
         content = "[分享视频] " + " | ".join(parts) if parts else "[分享视频]"
+        if cj.get("comment"):
+            content += "\n" + str(cj.get("comment_user_name") or "") + ": " + str(cj["comment"])
         chatlab_type = 24  # SHARE，统一类型
         stats["share"] = 1
     # 系统消息（msg_type=0 但不是语音 / 不是 share / 不是 video）
@@ -290,8 +420,8 @@ def _resolve_message(msg, cj: dict | None, media_dir: str) -> tuple:
         stats["system"] = 1
 
     # 最终兜底：还是 JSON 的内容统一收敛
-    if isinstance(content, str) and content.startswith("{") and content.endswith("}"):
-        content = "[分享内容]"
+    if isinstance(content, str) and content.startswith("{"):
+        content = str(cj.get("text") or cj.get("description") or cj.get("content_title") or "[分享内容]")
 
     return content, chatlab_type, stats
 
@@ -301,7 +431,7 @@ def _build_reply_to(ref_msg_raw) -> dict | None:
     if not ref_msg_raw:
         return None
     try:
-        ref = json.loads(ref_msg_raw) if isinstance(ref_msg_raw, str) else ref_msg_raw
+        ref = as_object(ref_msg_raw)
         ref_info = {}
         if ref.get("server_id"):
             ref_info["replyTo"] = f"srv_{ref['server_id']}"
@@ -314,12 +444,132 @@ def _build_reply_to(ref_msg_raw) -> dict | None:
         return None
 
 
+def _forward_text(detail, media_dir):
+    if not detail:
+        return "[合并转发] 正文未取得"
+    lines = [f"[合并转发] {detail['title']}（已取得 {detail['available']}/{detail['total']} 条）"]
+    for row in detail['items']:
+        if row.get('forward_detail') is not None:
+            text = _forward_text(row['forward_detail'], media_dir)
+        elif row.get('detail_missing'):
+            text = '[正文未取得，仅摘要] ' + (row.get('content') or '')
+        else:
+            text, _, _ = _resolve_message(row, _get_content_json(row), media_dir)
+        who = row.get('sender_name') or row.get('sender_uid') or '未知用户'
+        lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+
+CHATLAB_FORMAT_VERSION = "0.0.2"
+CHATLAB_GENERATOR = "douyin-chat-export"
+
+
+def conv_display_name(conv_name: str | None, conv_type: int) -> str:
+    """ChatLab meta.name: group keeps its name, private chats become 与X的对话."""
+    return conv_name if conv_type == 2 else f"与{conv_name}的对话"
+
+
+def build_chatlab_header(conv_id: str, conv_name: str | None, conv_type: int,
+                         owner_uid: str, exported_at: int | None = None) -> dict:
+    """The ``chatlab`` + ``meta`` blocks shared by file export and the pull API."""
+    header = {
+        "chatlab": {
+            "version": CHATLAB_FORMAT_VERSION,
+            "exportedAt": int(time.time()) if exported_at is None else exported_at,
+            "generator": CHATLAB_GENERATOR,
+        },
+        "meta": {
+            "name": conv_display_name(conv_name, conv_type),
+            "platform": "douyin",
+            "type": "group" if conv_type == 2 else "private",
+            "ownerId": owner_uid,
+        },
+    }
+    if conv_type == 2:
+        header["meta"]["groupId"] = conv_id
+    return header
+
+
+def sender_display_name(uid: str, sender_name: str | None, *, users_map: dict,
+                        owner_uid: str, owner_name: str, conv_type: int,
+                        conv_name: str | None) -> str:
+    """Nickname rule: users table → owner name → message sender_name → fallback."""
+    name = users_map.get(uid, "")
+    if name:
+        return name
+    if uid == owner_uid:
+        return owner_name
+    return sender_name or (f"用户{uid}" if conv_type == 2 else conv_name)
+
+
+def build_chatlab_message(msg, conn, media_dir: str, *, users_map: dict,
+                          owner_uid: str, owner_name: str, conv_type: int,
+                          conv_name: str | None, previous_shares: dict,
+                          embed_images: bool = True) -> tuple[dict, dict]:
+    """Convert one DB message row into a ChatLab message dict.
+
+    ``previous_shares`` (itemId → msg_id) is threaded through consecutive calls
+    so a "引用视频" reply can point back at the share it refers to; callers that
+    page through messages keep it per page. Returns (message, stats) where stats
+    is the counter dict from ``_resolve_message``.
+    """
+    cj = _get_content_json(msg)
+    uid = msg["sender_uid"] or ""
+    display_name = sender_display_name(
+        uid, msg["sender_name"], users_map=users_map, owner_uid=owner_uid,
+        owner_name=owner_name, conv_type=conv_type, conv_name=conv_name,
+    )
+
+    content, chatlab_type, stats = _resolve_message(msg, cj, media_dir, embed_images)
+    if str((cj or {}).get("aweType")) == "13600":
+        detail = resolve_forward(dict(msg), conn)
+        content = _forward_text(detail, media_dir)
+        chatlab_type = 26
+
+    chatlab_msg = {
+        "sender": uid,
+        "accountName": display_name,
+        "timestamp": msg["timestamp"] or 0,
+        "type": chatlab_type,
+        "content": content,
+        "platformMessageId": msg["msg_id"],
+    }
+
+    # 引用/回复消息
+    reply_to = _build_reply_to(msg["ref_msg"])
+    if reply_to:
+        chatlab_msg["replyTo"] = reply_to
+        if reply_to.get("replyTo"):
+            chatlab_msg["replyToMessageId"] = reply_to["replyTo"]
+    elif as_object((cj or {}).get("related_share_video")).get("itemId"):
+        item_id = str(cj["related_share_video"]["itemId"])
+        target = previous_shares.get(item_id)
+        if target:
+            chatlab_msg["replyToMessageId"] = target
+        content = str((cj or {}).get("text") or content)
+        chatlab_msg["content"] = content + "\n[引用视频] https://www.douyin.com/video/" + item_id
+    if (cj or {}).get("itemId") and not (cj or {}).get("related_share_video"):
+        previous_shares[str(cj["itemId"])] = msg["msg_id"]
+
+    return chatlab_msg, stats
+
+
 class ChatLabExporter:
-    def __init__(self, conv_name: str = None, output_format: str = "jsonl"):
+    def __init__(
+        self,
+        conv_name: str = None,
+        output_format: str = "jsonl",
+        output_dir: str | os.PathLike[str] | None = None,
+    ):
         self.conv_name = conv_name
         self.output_format = output_format  # "json" or "jsonl"
+        self.output_dir = (
+            paths.DATA_DIR if output_dir is None else os.fspath(output_dir)
+        )
 
-    def export(self, output_path: str):
+    def export(self, output_path: str | None = None) -> str | None:
+        from common.db import init_db
+        init_db()
         conn = get_db()
 
         # Detect owner
@@ -329,12 +579,12 @@ class ChatLabExporter:
         # Find conversation
         if self.conv_name:
             row = conn.execute(
-                "SELECT conv_id, name FROM conversations WHERE name LIKE ?",
-                (f"%{self.conv_name}%",),
+                "SELECT conv_id, name, conv_type FROM conversations WHERE name = ?",
+                (self.conv_name,),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT conv_id, name FROM conversations ORDER BY last_message_time DESC LIMIT 1"
+                "SELECT conv_id, name, conv_type FROM conversations ORDER BY last_message_time DESC LIMIT 1"
             ).fetchone()
 
         if not row:
@@ -346,9 +596,24 @@ class ChatLabExporter:
         conv_name = row["name"]
         print(f"[*] 导出会话: {conv_name} (ID: {conv_id})")
 
+        exported_at = int(time.time())
+        if output_path is None:
+            output_path = os.path.join(
+                self.output_dir,
+                build_export_filename(conv_name or conv_id, self.output_format, exported_at),
+            )
+        else:
+            output_path = os.fspath(output_path)
+
         # Load messages ordered by seq
         messages = conn.execute(
-            "SELECT * FROM messages WHERE conv_id = ? ORDER BY seq ASC",
+            """SELECT m.*,
+                      vt.text_result AS voice_transcription,
+                      vt.status AS voice_transcription_status,
+                      vt.error AS voice_transcription_error
+               FROM messages m
+               LEFT JOIN voice_transcriptions vt ON vt.msg_id = m.msg_id
+               WHERE m.conv_id = ? ORDER BY m.seq ASC""",
             (conv_id,),
         ).fetchall()
 
@@ -366,28 +631,17 @@ class ChatLabExporter:
         for msg in messages:
             uid = msg["sender_uid"] or ""
             if uid and uid not in members_map:
-                name = users_map.get(uid, "")
-                if not name:
-                    name = owner_name if uid == owner_uid else conv_name
-                members_map[uid] = name
+                members_map[uid] = sender_display_name(
+                    uid, msg["sender_name"], users_map=users_map,
+                    owner_uid=owner_uid, owner_name=owner_name,
+                    conv_type=row["conv_type"], conv_name=conv_name,
+                )
 
         # Media base dir
-        media_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "media")
+        media_dir = paths.MEDIA_DIR
 
         # Build ChatLab structure
-        header = {
-            "chatlab": {
-                "version": "0.0.2",
-                "exportedAt": int(time.time()),
-                "generator": "douyin-chat-export",
-            },
-            "meta": {
-                "name": f"与{conv_name}的对话",
-                "platform": "douyin",
-                "type": "private",
-                "ownerId": owner_uid,
-            },
-        }
+        header = build_chatlab_header(conv_id, conv_name, row["conv_type"], owner_uid, exported_at)
 
         members = []
         for uid, name in members_map.items():
@@ -404,16 +658,14 @@ class ChatLabExporter:
         share_normalized = 0
         ref_count = 0
 
+        previous_shares = {}
         for msg in messages:
-            cj = _get_content_json(msg)
-
-            # 发送方：从 users_map 获取昵称
-            uid = msg["sender_uid"] or ""
-            display_name = users_map.get(uid, "")
-            if not display_name:
-                display_name = owner_name if uid == owner_uid else conv_name
-
-            content, chatlab_type, stats = _resolve_message(msg, cj, media_dir)
+            chatlab_msg, stats = build_chatlab_message(
+                msg, conn, media_dir, users_map=users_map,
+                owner_uid=owner_uid, owner_name=owner_name,
+                conv_type=row["conv_type"], conv_name=conv_name,
+                previous_shares=previous_shares,
+            )
             voice_count += stats.get("voice", 0)
             video_count += stats.get("video", 0)
             emoji_count += stats.get("emoji", 0)
@@ -421,22 +673,8 @@ class ChatLabExporter:
             image_embedded += stats.get("image_embedded", 0)
             share_normalized += stats.get("share", 0)
             system_count += stats.get("system", 0)
-
-            chatlab_msg = {
-                "sender": uid,
-                "accountName": display_name,
-                "timestamp": msg["timestamp"] or 0,
-                "type": chatlab_type,
-                "content": content,
-                "platformMessageId": msg["msg_id"],
-            }
-
-            # 引用/回复消息
-            reply_to = _build_reply_to(msg["ref_msg"])
-            if reply_to:
-                chatlab_msg["replyTo"] = reply_to
+            if "replyTo" in chatlab_msg:
                 ref_count += 1
-
             chatlab_messages.append(chatlab_msg)
 
         conn.close()
@@ -483,3 +721,4 @@ class ChatLabExporter:
             print(f"  引用/回复: {ref_count}")
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"  文件大小: {size_mb:.1f} MB")
+        return output_path

@@ -2,8 +2,11 @@
 import asyncio
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 import time
+from threading import Lock
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -32,9 +35,29 @@ def _save_config(cfg):
     _cfg.save_config(cfg)
 
 
+def _utf8_subprocess_env() -> dict:
+    """强制被重定向的 Python 子进程输出走 UTF-8（Windows 默认 GBK 会乱码）。"""
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _read_utf8_or_gbk(path: str) -> str:
+    """读日志：优先 UTF-8，回退到旧的 Windows GBK/GB18030 日志。"""
+    with open(path, "rb") as file:
+        raw = file.read()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("gb18030", errors="replace")
+
+
 # ── Scrape job state ──
 _scrape_state = {
     "status": "idle",  # idle | running | completed | failed
+    "kind": "scrape",  # scrape | voice_backfill
     "started_at": None,
     "finished_at": None,
     "message": "",
@@ -47,6 +70,11 @@ _export_state = {
     "file_path": None,
     "message": "",
 }
+
+# Database export/import replaces a single SQLite file. Keep the file swap
+# serialized with snapshots and retain a rollback copy of the previous file.
+_DATABASE_FILE_LOCK = Lock()
+_DATABASE_IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 # ── Scheduler state ──
 _scheduler_state = {
@@ -90,6 +118,7 @@ _video_backfill_state = {
 }
 
 LOG_PATH = paths.SCRAPE_LOG
+VOICE_LOG_PATH = paths.VOICE_TRANSCRIPTION_LOG
 DISCOVER_LOG_PATH = paths.DISCOVER_LOG
 CONV_LIST_PATH = paths.CONVERSATIONS_LIST
 
@@ -120,6 +149,10 @@ class ScrapeRequest(BaseModel):
     incremental: bool = True
     filter: str = ""
     conversations: list[str] | None = None  # selected nicknames; overrides filter
+
+
+class VoiceBackfillRequest(BaseModel):
+    conversations: list[str] | None = None  # selected nicknames; empty = all DB candidates
 
 
 class ExportRequest(BaseModel):
@@ -417,7 +450,10 @@ async def _run_video_backfill():
 @control_router.get("", response_class=HTMLResponse)
 @control_router.get("/", response_class=HTMLResponse)
 async def panel_page():
-    return PANEL_HTML
+    return HTMLResponse(
+        content=PANEL_HTML,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+    )
 
 
 @control_router.get("/api/status")
@@ -441,6 +477,7 @@ async def panel_status():
         "custom_filters": cfg.get("custom_filters", []),
         "scrape": {
             "status": _scrape_state["status"],
+            "kind": _scrape_state.get("kind", "scrape"),
             "started_at": _scrape_state["started_at"],
             "finished_at": _scrape_state["finished_at"],
             "message": _scrape_state["message"],
@@ -482,6 +519,7 @@ async def start_scrape(req: ScrapeRequest):
         cmd.append("--download-images")
 
     _scrape_state["status"] = "running"
+    _scrape_state["kind"] = "scrape"
     _scrape_state["started_at"] = time.time()
     _scrape_state["finished_at"] = None
     _scrape_state["message"] = f"{'增量' if req.incremental else '全量'}采集"
@@ -500,19 +538,45 @@ async def start_scrape(req: ScrapeRequest):
     return {"status": "started", "message": _scrape_state["message"]}
 
 
-async def _run_scrape(cmd):
+@control_router.post("/api/voice-transcriptions/backfill")
+async def start_voice_backfill(req: VoiceBackfillRequest | None = None):
+    """Start a local-DB voice backfill without fetching chat history again."""
+    if _scrape_state["status"] == "running":
+        return JSONResponse({"error": "Scrape already running"}, status_code=409)
+
+    conversations = list((req.conversations if req else None) or [])
+    cmd = [sys.executable, "-u", "extract.py", "--transcribe-voices"]
+    if conversations:
+        cmd.extend(["--filter", ",".join(conversations)])
+
+    _scrape_state["status"] = "running"
+    _scrape_state["kind"] = "voice_backfill"
+    _scrape_state["started_at"] = time.time()
+    _scrape_state["finished_at"] = None
+    _scrape_state["message"] = "补充历史语音转写"
+    if conversations:
+        _scrape_state["message"] += f" ({len(conversations)} 个会话)"
+    asyncio.create_task(
+        _run_scrape(cmd, log_path=VOICE_LOG_PATH, job_kind="voice_backfill")
+    )
+    return {"status": "started", "message": _scrape_state["message"]}
+
+
+async def _run_scrape(cmd, *, log_path=None, job_kind="scrape"):
     # Reset here (not in start_scrape) so BOTH the manual and cron paths clear a
     # prior manual-stop flag; otherwise a scheduled scrape after a manual Stop
     # would be mislabeled '已停止' and its failure notification suppressed.
     _scrape_state["stopped"] = False
     try:
-        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-        with open(LOG_PATH, "w") as log_file:
+        log_path = log_path or LOG_PATH
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", encoding="utf-8", newline="") as log_file:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=os.path.dirname(os.path.dirname(__file__)),
+                env=_utf8_subprocess_env(),
             )
             _scrape_state["process"] = proc
             await proc.wait()
@@ -524,20 +588,25 @@ async def _run_scrape(cmd):
             _scrape_state["message"] = "已停止"
         elif proc.returncode == 0:
             _scrape_state["status"] = "completed"
-            _scrape_state["message"] = "采集完成"
+            _scrape_state["message"] = (
+                "语音转写补充完成" if job_kind == "voice_backfill" else "采集完成"
+            )
         else:
             _scrape_state["status"] = "failed"
-            _scrape_state["message"] = f"采集失败 (exit code {proc.returncode})"
+            label = "语音转写补充" if job_kind == "voice_backfill" else "采集"
+            _scrape_state["message"] = f"{label}失败 (exit code {proc.returncode})"
     except Exception as e:
         _scrape_state["status"] = "failed"
-        _scrape_state["message"] = f"采集错误: {e}"
+        label = "语音转写补充" if job_kind == "voice_backfill" else "采集"
+        _scrape_state["message"] = f"{label}错误: {e}"
     finally:
         _scrape_state["finished_at"] = time.time()
         _scrape_state["process"] = None
         if _scrape_state["status"] == "failed" and not _scrape_state.get("stopped"):
+            label = "语音转写补充" if job_kind == "voice_backfill" else "采集"
             asyncio.create_task(_notify_on_failure(
-                "抖音聊天导出 · 采集失败",
-                _build_failure_desp(_scrape_state["message"], LOG_PATH),
+                f"抖音聊天导出 · {label}失败",
+                _build_failure_desp(_scrape_state["message"], log_path),
             ))
 
 
@@ -546,8 +615,19 @@ async def scrape_log(lines: int = 50):
     if not os.path.exists(LOG_PATH):
         return {"log": ""}
     try:
-        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
+        all_lines = _read_utf8_or_gbk(LOG_PATH).splitlines(keepends=True)
+        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        return {"log": "".join(tail)}
+    except Exception:
+        return {"log": ""}
+
+
+@control_router.get("/api/voice-transcriptions/log")
+async def voice_transcription_log(lines: int = 80):
+    if not os.path.exists(VOICE_LOG_PATH):
+        return {"log": ""}
+    try:
+        all_lines = _read_utf8_or_gbk(VOICE_LOG_PATH).splitlines(keepends=True)
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
         return {"log": "".join(tail)}
     except Exception:
@@ -559,8 +639,7 @@ async def discover_log(lines: int = 80):
     if not os.path.exists(DISCOVER_LOG_PATH):
         return {"log": ""}
     try:
-        with open(DISCOVER_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
+        all_lines = _read_utf8_or_gbk(DISCOVER_LOG_PATH).splitlines(keepends=True)
         tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
         return {"log": "".join(tail)}
     except Exception:
@@ -644,8 +723,7 @@ async def _probe_login_state() -> dict:
                     await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
                     await asyncio.sleep(2)
                     cookies = await ctx.cookies("https://www.douyin.com")
-                    cookie_names = {c["name"] for c in cookies}
-                    has_login = "sessionid" in cookie_names
+                    has_login = any(c["name"] == "sessionid" and c["value"] for c in cookies)
                     return {
                         "status": "logged_in" if has_login else "expired",
                         "has_cookies": has_login,
@@ -690,12 +768,13 @@ async def _run_discover(cmd):
     proc = None
     try:
         os.makedirs(os.path.dirname(DISCOVER_LOG_PATH), exist_ok=True)
-        with open(DISCOVER_LOG_PATH, "w") as log_file:
+        with open(DISCOVER_LOG_PATH, "w", encoding="utf-8", newline="") as log_file:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=os.path.dirname(os.path.dirname(__file__)),
+                env=_utf8_subprocess_env(),
             )
             _discover_state["process"] = proc
             await proc.wait()
@@ -846,6 +925,7 @@ async def _cron_loop(parsed: list, incremental: bool):
                 if filters:
                     cmd.extend(["--filter", ",".join(filters)])
                 _scrape_state["status"] = "running"
+                _scrape_state["kind"] = "scrape"
                 _scrape_state["started_at"] = time.time()
                 _scrape_state["finished_at"] = None
                 filter_desc = f" (过滤: {','.join(filters[:5])}{'...' if len(filters) > 5 else ''})" if filters else " (全部会话)"
@@ -863,6 +943,7 @@ async def start_export(req: ExportRequest):
         return JSONResponse({"error": "Export already running"}, status_code=409)
 
     _export_state["status"] = "running"
+    _export_state["file_path"] = None
     _export_state["message"] = "正在导出..."
 
     # Persist selection
@@ -881,14 +962,213 @@ async def start_export(req: ExportRequest):
     }
 
 
+@control_router.post("/api/database/import")
+async def import_database(request: Request):
+    """Validate and atomically replace the local SQLite database."""
+    conflict = _database_job_conflict()
+    if conflict:
+        return JSONResponse({"error": conflict}, status_code=409)
+
+    content_length = request.headers.get("content-length")
+    try:
+        if content_length and int(content_length) > _DATABASE_IMPORT_MAX_BYTES:
+            return JSONResponse({"error": "导入文件过大"}, status_code=413)
+    except ValueError:
+        pass
+
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    allowed_types = {"", "application/octet-stream", "application/x-sqlite3", "application/vnd.sqlite3"}
+    if content_type not in allowed_types:
+        return JSONResponse({"error": "请上传 SQLite 数据库文件"}, status_code=415)
+
+    os.makedirs(paths.DATA_DIR, exist_ok=True)
+    fd, staged_path = tempfile.mkstemp(
+        prefix=".chat_database_import_", suffix=".db", dir=paths.DATA_DIR
+    )
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as staged:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > _DATABASE_IMPORT_MAX_BYTES:
+                    return JSONResponse({"error": "导入文件过大"}, status_code=413)
+                staged.write(chunk)
+
+        if size == 0:
+            return JSONResponse({"error": "导入文件为空"}, status_code=400)
+
+        try:
+            _validate_database_file(staged_path)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            return JSONResponse({"error": f"数据库校验失败: {exc}"}, status_code=400)
+
+        try:
+            backup_name = _install_database(staged_path)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            return JSONResponse({"error": f"数据库替换失败: {exc}"}, status_code=500)
+
+        message = "数据库导入完成，已覆盖当前数据库"
+        if backup_name:
+            message += f"；旧数据库已备份为 {backup_name}"
+        return {"status": "ok", "message": message, "backup_file": backup_name}
+    finally:
+        try:
+            os.remove(staged_path)
+        except FileNotFoundError:
+            pass
+
+
+def _database_job_conflict() -> str | None:
+    """Return a user-facing reason why replacing the DB is unsafe now."""
+    if _scrape_state["status"] == "running":
+        return "采集任务正在运行，请完成后再导入数据库"
+    if _backfill_state["status"] == "running":
+        return "历史图片下载正在运行，请完成后再导入数据库"
+    if _video_backfill_state["status"] == "running":
+        return "历史视频下载正在运行，请完成后再导入数据库"
+    if _export_state["status"] == "running":
+        return "导出任务正在运行，请完成后再导入数据库"
+    return None
+
+
+def _database_snapshot(output_path: str) -> None:
+    """Create a consistent standalone SQLite snapshot, including WAL data."""
+    temp_path = f"{output_path}.tmp"
+    try:
+        with _DATABASE_FILE_LOCK:
+            source = sqlite3.connect(paths.DB_PATH)
+            target = sqlite3.connect(temp_path)
+            try:
+                source.execute("PRAGMA busy_timeout=10000")
+                source.backup(target, pages=1000, sleep=0.05)
+            finally:
+                target.close()
+                source.close()
+            os.replace(temp_path, output_path)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _do_database_export() -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"chat_database_{timestamp}.db"
+    output_path = os.path.join(paths.DATA_DIR, filename)
+    collision_index = 2
+    while os.path.exists(output_path):
+        filename = f"chat_database_{timestamp}_{collision_index}.db"
+        output_path = os.path.join(paths.DATA_DIR, filename)
+        collision_index += 1
+    os.makedirs(paths.DATA_DIR, exist_ok=True)
+    _database_snapshot(output_path)
+    return output_path
+
+
+def _validate_database_file(path: str) -> None:
+    """Validate an uploaded SQLite file before it can replace chat.db."""
+    required_columns = {
+        "users": {"uid"},
+        "conversations": {"conv_id", "name"},
+        "messages": {"msg_id", "conv_id", "raw_data"},
+    }
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        check = conn.execute("PRAGMA quick_check").fetchone()
+        if not check or check[0] != "ok":
+            raise ValueError("数据库完整性检查未通过")
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_key_errors:
+            raise ValueError("数据库外键完整性检查未通过")
+        for table, columns in required_columns.items():
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"数据库缺少表: {table}")
+            actual = {item[1] for item in conn.execute(f"PRAGMA table_info({table})")}
+            missing = columns - actual
+            if missing:
+                raise ValueError(f"数据库表 {table} 缺少字段: {', '.join(sorted(missing))}")
+    finally:
+        conn.close()
+
+
+def _move_if_exists(source: str, target: str) -> bool:
+    if not os.path.exists(source):
+        return False
+    os.replace(source, target)
+    return True
+
+
+def _install_database(staged_path: str) -> str | None:
+    """Atomically install a validated DB and keep the previous one recoverable."""
+    db_path = paths.DB_PATH
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(paths.DATA_DIR, f"chat_database_before_import_{timestamp}.db")
+    suffixes = ("-wal", "-shm")
+    moved_sidecars: list[tuple[str, str]] = []
+    moved_db = False
+    installed = False
+
+    if os.path.exists(backup_path):
+        index = 2
+        while os.path.exists(backup_path):
+            backup_path = os.path.join(
+                paths.DATA_DIR,
+                f"chat_database_before_import_{timestamp}_{index}.db",
+            )
+            index += 1
+
+    with _DATABASE_FILE_LOCK:
+        try:
+            if os.path.exists(db_path):
+                os.replace(db_path, backup_path)
+                moved_db = True
+            for suffix in suffixes:
+                old_sidecar = db_path + suffix
+                backup_sidecar = backup_path + suffix
+                if _move_if_exists(old_sidecar, backup_sidecar):
+                    moved_sidecars.append((old_sidecar, backup_sidecar))
+            os.replace(staged_path, db_path)
+            installed = True
+
+            from common.db import init_db
+            init_db()
+        except Exception:
+            try:
+                if os.path.exists(db_path) and installed:
+                    os.remove(db_path)
+                if moved_db and os.path.exists(backup_path):
+                    os.replace(backup_path, db_path)
+                for original, backup in reversed(moved_sidecars):
+                    if os.path.exists(backup):
+                        os.replace(backup, original)
+            finally:
+                raise
+
+    return os.path.basename(backup_path) if moved_db else None
+
+
 def _do_export(fmt: str, filter_name: str, conversations: list | None):
     try:
-        from extractor.exporter import ChatLabExporter
-        import re
+        from extractor.exporter import ChatLabExporter, build_export_filename
         import zipfile
 
-        ext = ".json" if fmt == "json" else ".jsonl"
-        data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+        data_dir = paths.DATA_DIR
+
+        if fmt == "database":
+            output_path = _do_database_export()
+            _export_state["file_path"] = os.path.basename(output_path)
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            _export_state["message"] = f"数据库导出完成 ({size_mb:.1f} MB)"
+            _export_state["status"] = "completed"
+            return
 
         # Decide targets
         if conversations:
@@ -900,18 +1180,15 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
 
         if len(targets) <= 1:
             # Single file
-            output_path = os.path.join(data_dir, f"export{ext}")
-            # Remove stale file so a "conv not found" early-return doesn't look like success
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
-            exporter = ChatLabExporter(conv_name=targets[0] or None, output_format=fmt)
-            exporter.export(output_path)
-            if not os.path.exists(output_path):
+            exporter = ChatLabExporter(
+                conv_name=targets[0] or None,
+                output_format=fmt,
+                output_dir=data_dir,
+            )
+            output_path = exporter.export()
+            if not output_path or not os.path.exists(output_path):
                 raise RuntimeError(f"未找到会话: {targets[0] or '(any)'}")
-            _export_state["file_path"] = f"export{ext}"
+            _export_state["file_path"] = os.path.basename(output_path)
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             _export_state["message"] = f"导出完成 ({size_mb:.1f} MB)"
         else:
@@ -926,9 +1203,18 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
                     pass
 
             produced = []
+            used_filenames = set()
+            exported_at = int(time.time())
             for name in targets:
-                safe = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", name)[:80] or "conv"
-                path = os.path.join(tmp_dir, f"{safe}{ext}")
+                filename = build_export_filename(name, fmt, exported_at)
+                collision_index = 2
+                while filename in used_filenames:
+                    filename = build_export_filename(
+                        name, fmt, exported_at, collision_index=collision_index
+                    )
+                    collision_index += 1
+                used_filenames.add(filename)
+                path = os.path.join(tmp_dir, filename)
                 try:
                     ChatLabExporter(conv_name=name, output_format=fmt).export(path)
                     if os.path.exists(path):
@@ -958,9 +1244,7 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
 async def download_export():
     if not _export_state["file_path"]:
         return JSONResponse({"error": "No export file"}, status_code=404)
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "data", _export_state["file_path"]
-    )
+    path = os.path.join(paths.DATA_DIR, _export_state["file_path"])
     if not os.path.exists(path):
         return JSONResponse({"error": "File not found"}, status_code=404)
     return FileResponse(path, filename=_export_state["file_path"])
@@ -1302,8 +1586,7 @@ async def _login_flow():
 
         # Check if already logged in
         cookies = await ctx.cookies("https://www.douyin.com")
-        cookie_names = {c["name"] for c in cookies}
-        if "sessionid" in cookie_names:
+        if any(c["name"] == "sessionid" and c["value"] for c in cookies):
             _login_state["status"] = "logged_in"
             _login_state["message"] = "已登录，无需扫码"
             await _login_cleanup()
@@ -1337,8 +1620,7 @@ async def _login_flow():
 
             # Check login
             cookies = await ctx.cookies("https://www.douyin.com")
-            cookie_names = {c["name"] for c in cookies}
-            if "sessionid" in cookie_names:
+            if any(c["name"] == "sessionid" and c["value"] for c in cookies):
                 _login_state["status"] = "logged_in"
                 _login_state["message"] = "登录成功！"
                 _login_state["screenshot"] = None

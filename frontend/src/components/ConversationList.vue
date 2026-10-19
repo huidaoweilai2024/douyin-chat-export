@@ -2,7 +2,7 @@
   <div class="conv-list">
     <div class="conv-header">
       <h2>会话</h2>
-      <span class="conv-count">{{ total }}</span>
+      <a class="panel-link" href="/panel">管理面板</a>
     </div>
     <div class="conv-search">
       <input
@@ -69,7 +69,6 @@ const props = defineProps({
 const emit = defineEmits(['select', 'deleted'])
 
 const conversations = ref([])
-const total = ref(0)
 const searchQuery = ref('')
 const pendingDelete = ref(null)
 const deleting = ref(false)
@@ -85,7 +84,6 @@ async function fetchConversations(search = '') {
   const res = await fetch(`/api/conversations?${params}`)
   const data = await res.json()
   conversations.value = data.items
-  total.value = data.total
 }
 
 function onSearch() {
@@ -119,7 +117,6 @@ async function confirmDelete() {
       return
     }
     conversations.value = conversations.value.filter(c => c.conv_id !== conv.conv_id)
-    total.value = Math.max(0, total.value - 1)
     emit('deleted', conv.conv_id)
     pendingDelete.value = null
   } catch (e) {
@@ -154,13 +151,9 @@ onMounted(() => {
   font-size: 16px;
   font-weight: 600;
 }
-.conv-count {
-  background: var(--accent);
-  color: white;
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 10px;
-}
+.panel-link { margin-right: auto; margin-left: 10px; padding: 4px 7px; border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px; text-decoration: none; color: var(--text-secondary); }
+.panel-link:hover { color: var(--accent); border-color: var(--accent); }
+
 
 .conv-search {
   padding: 8px 12px;

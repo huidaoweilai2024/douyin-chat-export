@@ -4,6 +4,7 @@ import hmac
 import os
 import secrets
 import time
+from typing import Literal
 
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import database
 from common import config, paths
 
-app = FastAPI(title="抖音聊天记录浏览器", version="1.0.0")
+app = FastAPI(title="抖音聊天记录浏览器", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,6 +47,14 @@ def _verify_token(token: str) -> bool:
     return False
 
 
+def _verify_api_token(token: str, path: str, method: str) -> bool:
+    """持久 API token 只授权只读端点：GET /api/*（面板与删除操作除外）。"""
+    if not token or method != "GET" or not path.startswith("/api/"):
+        return False
+    api_token = config.get_api_token()
+    return bool(api_token) and hmac.compare_digest(token, api_token)
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -73,7 +82,22 @@ async def auth_middleware(request: Request, call_next):
         token = request.cookies.get("auth_token", "")
     if _verify_token(token):
         return await call_next(request)
+    if _verify_api_token(token, path, request.method):
+        return await call_next(request)
     return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+
+@app.middleware("http")
+async def utf8_response_middleware(request: Request, call_next):
+    """让浏览器显式按 UTF-8 解码（Windows 部署下尤其重要）。"""
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if (
+        content_type.startswith(("application/json", "text/html"))
+        and "charset=" not in content_type.lower()
+    ):
+        response.headers["content-type"] = f"{content_type}; charset=utf-8"
+    return response
 
 
 from pydantic import BaseModel
@@ -166,7 +190,50 @@ def list_messages(
     if not conv:
         raise HTTPException(404, "会话不存在")
     items, total = database.get_messages(conv_id, page_size=page_size, before_seq=before_seq, after_seq=after_seq)
-    return {"items": items, "total": total}
+    return {"items": items, "total": total, **database.get_message_page_bounds(conv_id, items)}
+
+
+@app.get("/api/conversations/{conv_id}/messages/by-date")
+def list_messages_by_date(
+    conv_id: str,
+    date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    tz: float = Query(8, ge=-12, le=14),
+    limit: int = Query(5000, ge=1, le=5000),
+):
+    conv = database.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "会话不存在")
+    items = database.get_messages_by_date(conv_id, date, tz_hours=tz, limit=limit)
+    return {"items": items, "total": len(items), "date": date}
+
+
+@app.get("/api/conversations/{conv_id}/messages/range")
+def list_messages_range(
+    conv_id: str,
+    start_seq: int = Query(..., ge=0),
+    end_seq: int = Query(..., ge=0),
+):
+    if end_seq < start_seq:
+        raise HTTPException(400, "end_seq 不能小于 start_seq")
+    conv = database.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "会话不存在")
+    items = database.get_messages_range(conv_id, start_seq, end_seq)
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/api/conversations/{conv_id}/stats/daily")
+def daily_stats(conv_id: str, tz: float = Query(8, ge=-12, le=14)):
+    conv = database.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "会话不存在")
+    return {"items": database.get_daily_stats(conv_id, tz_hours=tz)}
+
+
+@app.get("/api/token")
+def get_api_token():
+    """查看持久 API token（受与其余 /api/ 相同的鉴权保护）。"""
+    return {"token": config.ensure_api_token()}
 
 
 @app.get("/api/conversations/{conv_id}/senders")
@@ -179,11 +246,22 @@ def list_senders(conv_id: str):
 
 @app.get("/api/search")
 def search(
-    q: str = Query(..., min_length=1),
+    q: str = Query(""),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
+    conv_id: str | None = Query(None),
+    start_time: int | None = Query(None, ge=0),
+    end_time: int | None = Query(None, ge=0),
+    media_type: Literal["image", "video", "media"] | None = Query(None),
 ):
-    items, total = database.search_messages(q, page=page, page_size=page_size)
+    if start_time is not None and end_time is not None and start_time >= end_time:
+        raise HTTPException(422, "结束时间必须晚于开始时间")
+    if not q.strip() and not conv_id and start_time is None and end_time is None and not media_type:
+        raise HTTPException(422, "请指定搜索条件")
+    items, total = database.search_messages(
+        q.strip(), page=page, page_size=page_size, conv_id=conv_id,
+        start_time=start_time, end_time=end_time, media_type=media_type,
+    )
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
@@ -193,6 +271,31 @@ def get_message(msg_id: str):
     if not msg:
         raise HTTPException(404, "消息不存在")
     return msg
+
+
+@app.get("/api/messages/{msg_id}/forward")
+def get_forward_messages(msg_id: str):
+    from .forwarded import resolve_forward
+
+    msg = database.get_message(msg_id)
+    if not msg:
+        raise HTTPException(404, "消息不存在")
+    conn = database.get_db()
+    try:
+        result = resolve_forward(msg, conn)
+    finally:
+        conn.close()
+    if result is None:
+        raise HTTPException(422, "这不是合并转发消息")
+    return result
+
+
+@app.get("/api/messages/{msg_id}/referenced-video")
+def get_referenced_video(msg_id: str):
+    message = database.find_referenced_video(msg_id)
+    if not message:
+        raise HTTPException(404, "引用的消息未归档")
+    return message
 
 
 @app.get("/api/users")
@@ -212,9 +315,20 @@ def get_user(uid: str):
 from backend.control_panel import control_router, restore_schedule_on_startup
 app.include_router(control_router)
 
+# Screenshot rendering (headless chromium against our own frontend)
+from backend.screenshot import screenshot_router
+app.include_router(screenshot_router)
+
+# ChatLab 远程数据源协议（Pull 模式）：ChatLab 定时来拉增量消息
+from backend.chatlab_pull import chatlab_router
+app.include_router(chatlab_router)
+
 
 @app.on_event("startup")
 async def startup():
+    from common.db import init_db
+    init_db()
+    config.ensure_api_token()
     await restore_schedule_on_startup()
 
 # Serve Vue frontend (must be last)

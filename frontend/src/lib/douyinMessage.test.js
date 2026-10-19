@@ -4,7 +4,8 @@ import {
   isJsonSticker, isJsonSystemMsg, isVoiceMsg, getVoiceDuration, getVoiceUrl,
   isVideoMsg, isJsonVideo, getVideoDuration, getInlinePic, getImageSrc, getEmojiSrc,
   getRefMsg, getRefContent, getRefNickname, extractServerMsgIds, isRecalled,
-  getWatchTogether,
+  getWatchTogether, getProfileCard, getForwardInfo, isSystemMsg, duplicateSystemMessageIds,
+  isLooseEmoji, isLooseShare, isLooseImage, isShareCard,
 } from './douyinMessage.js'
 
 // Build a message row. content_json is double-encoded inside raw_data, like the DB.
@@ -78,6 +79,16 @@ describe('sticker / voice / video detection', () => {
     expect(getVoiceDuration(v)).toBe(4)
     expect(getVoiceUrl(v)).toBe('http://v')
   })
+  it('voice: recognizes legacy text-typed rows and resource duration', () => {
+    const v = withCj({ resource_url: { uri: 'voice-uri', duration: '1200' } }, { msg_type: 1 })
+    expect(isVoiceMsg(v)).toBe(true)
+    expect(getVoiceDuration(v)).toBe(1)
+    expect(getVoiceUrl(v)).toBe('voice-uri')
+  })
+  it('voice: does not classify an image resource with a duration as audio', () => {
+    const image = withCj({ aweType: 2702, resource_url: { url_list: ['http://image'] }, duration: 1200 }, { msg_type: 3 })
+    expect(isVoiceMsg(image)).toBe(false)
+  })
   it('video: msg_type 5 or cj.video.vid; duration in seconds with ″', () => {
     expect(isJsonVideo(msg({ msg_type: 5 }))).toBe(true)
     expect(isJsonVideo(withCj({ video: { vid: 'v1' } }))).toBe(true)
@@ -144,5 +155,116 @@ describe('misc', () => {
   it('isRecalled reads is_recalled', () => {
     expect(isRecalled(withCj({ is_recalled: true }))).toBe(true)
     expect(isRecalled(msg({ content: 'hi' }))).toBe(false)
+  })
+})
+
+// issue #36: names/cards, actor perspective and merged-record detection.
+describe('issue 36 message cards and system perspective', () => {
+  it('changes like pronouns without altering the referenced video name', () => {
+    const m = withCj({ aweType: 126, tips: '{{1}}赞了你分享的 {{2}}', template: [
+      { key: 1, name: '对方' }, { key: 2, name: '你和对方的旅行 $&' },
+    ] }, { sender_uid: 'alice' })
+    expect(renderSystemMsg(m, 'alice')).toBe('你赞了对方分享的 你和对方的旅行 $&')
+    expect(renderSystemMsg(m, 'bob')).toBe('对方赞了你分享的 你和对方的旅行 $&')
+    expect(renderSystemMsg(m)).toBe('对方赞了你分享的 你和对方的旅行 $&')
+  })
+  it('changes spark claims in both directions', () => {
+    const m = withCj({ aweType: 287, tips: '对方领取了火星 {{0}}', template: [{ key: 0, name: '查看' }] }, { sender_uid: 'alice' })
+    expect(renderSystemMsg(m, 'alice')).toBe('你领取了火星 查看')
+    expect(renderSystemMsg(m, 'bob')).toBe('对方领取了火星 查看')
+  })
+  it('does not share parsed content between distinct rows with the same ID', () => {
+    const a = withCj({ text: 'old' }, { msg_id: 'same' })
+    const b = withCj({ text: 'new' }, { msg_id: 'same' })
+    expect(getContentJson(a).text).toBe('old')
+    expect(getContentJson(b).text).toBe('new')
+  })
+})
+
+
+describe('profile and forwarded cards', () => {
+  it('renders old profile rows of every stored type using the complete JSON', () => {
+    for (const type of [0, 1, 4]) {
+      const m = withCj({ name: '名片', secUID: 'MS4w-test', desc: 'douyin123', follower_count: 0,
+        avatar: { url_list: ['https://example.com/avatar.jpg'] } }, { msg_type: type, content: '{"name":' })
+      expect(getProfileCard(m)).toEqual({ name: '名片', avatar: 'https://example.com/avatar.jpg', description: 'douyin123', followers: 0, url: 'https://www.douyin.com/user/MS4w-test' })
+      expect(shouldShow(m)).toBe(true)
+      expect(isSystemMsg(m)).toBe(false)
+    }
+  })
+  it('does not confuse video shares with profiles or malformed summaries with arrays', () => {
+    expect(getProfileCard(withCj({ content_name: '作者', secUID: 'abc', itemId: '42' }))).toBeNull()
+    const m = withCj({ aweType: 13600, title: '聊天记录', list_content: {}, msg_ids: null }, { msg_type: 0 })
+    expect(getForwardInfo(m).preview).toEqual([])
+    expect(isSystemMsg(m)).toBe(false)
+    expect(shouldShow(m)).toBe(true)
+  })
+  it('pairs opposite notifications but retains repeated likes and different actors', () => {
+    const make = (tips, fields = {}) => withCj({ aweType: 126, tips,
+      template: [{ key: 2, name: '视频', extra: { server_message_id: '7600000000000000012' } }],
+    }, { sender_uid: 'alice', conv_id: 'c1', timestamp: 100, ...fields })
+    const a = make('你赞了{{1}}分享的 {{2}}')
+    const b = make('{{1}}赞了你分享的 {{2}}', { timestamp: 115 })
+    const c = make('你赞了{{1}}分享的 {{2}}', { timestamp: 116 })
+    expect([...duplicateSystemMessageIds([a, b, c])]).toEqual([b.msg_id])
+    expect(duplicateSystemMessageIds([a, make('{{1}}赞了你分享的 {{2}}', { sender_uid: 'bob' })]).size).toBe(0)
+    expect(duplicateSystemMessageIds([a, make('{{1}}赞了你分享的 {{2}}', { timestamp: 131 })]).size).toBe(0)
+  })
+})
+
+describe('leftover media payload display', () => {
+  it('treats awe 515/517/520 as loose emoji instead of system lines', () => {
+    const emoji = withCj({
+      aweType: 517,
+      url: { url_list: ['http://cdn/e.webp'] },
+    }, { msg_type: 0, content: '{"aweType":517}' })
+    expect(isLooseEmoji(emoji)).toBe(true)
+    expect(getEmojiSrc(emoji)).toBe('http://cdn/e.webp')
+    expect(shouldShow(emoji)).toBe(true)
+    expect(isSystemMsg(emoji)).toBe(false)
+  })
+
+  it('renders poi / awe 805 / 2104 as share cards', () => {
+    const poi = withCj({
+      aweType: 0,
+      poi_name: '某咖啡店',
+      aweme_poi_id: '123',
+      cover_info: { resource_url: { url_list: ['http://cdn/poi.jpg'] } },
+    }, { msg_type: 1, content: '{"poi_name":"某咖啡店"}' })
+    expect(isLooseShare(poi)).toBe(true)
+    expect(getShareInfo(poi).title).toBe('某咖啡店')
+    expect(getShareInfo(poi).cover).toBe('http://cdn/poi.jpg')
+
+    const live = withCj({
+      aweType: 2104,
+      push_detail: '杏仁体',
+      cover_url: { url_list: ['http://cdn/live.jpg'] },
+    }, { msg_type: 0, content: '杏仁体' })
+    expect(isShareCard(live)).toBe(true)
+    expect(getShareInfo(live).title).toBe('杏仁体')
+    expect(shouldShow(live)).toBe(true)
+
+    const work = withCj({
+      aweType: 805,
+      content_title: '作品标题',
+      cover_url: { url_list: ['http://cdn/w.jpg'] },
+      itemId: '99',
+    }, { msg_type: 0, content: '{"aweType":805,"content_title":"作品标题"}' })
+    expect(isLooseShare(work)).toBe(true)
+    expect(getShareInfo(work).itemId).toBe('99')
+  })
+
+  it('renders inline_pic leftovers as images instead of raw JSON', () => {
+    const pic = withCj({
+      aweType: 0,
+      inline_pic: 'QQ',
+      check_pics: ['tos-x'],
+      create_type: 0,
+    }, { msg_type: 1, content: '{"inline_pic":"QQ"}' })
+    expect(isLooseImage(pic)).toBe(true)
+    expect(getImageSrc(pic)).toBe('data:image/webp;base64,QQ')
+    expect(shouldShow(pic)).toBe(true)
+    expect(isSystemMsg(pic)).toBe(false)
+
   })
 })

@@ -1,13 +1,35 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import ConversationList from './components/ConversationList.vue'
 import MessageList from './components/MessageList.vue'
 import SearchBar from './components/SearchBar.vue'
+import ScreenshotView from './components/ScreenshotView.vue'
+
+// 截图模式：后端 headless 浏览器访问 /screenshot?...&token=<临时token>
+const isScreenshotMode = location.pathname === '/screenshot'
 
 const activeConversation = ref(null)
 const searchHighlight = ref('')
 const jumpToSeq = ref(null)
-const sidebarOpen = ref(false)
+const mobileLayout = window.matchMedia('(max-width: 768px)')
+const sidebarOpen = ref(!mobileLayout.matches)
+const syncSidebarLayout = () => { sidebarOpen.value = !mobileLayout.matches }
+mobileLayout.addEventListener('change', syncSidebarLayout)
+onUnmounted(() => mobileLayout.removeEventListener('change', syncSidebarLayout))
+const searchOpen = ref(false)
+const readerLayout = ref(null)
+async function setSearchOpen(open) {
+  const list = readerLayout.value?.querySelector('.msg-list')
+  const bottom = list && list.scrollHeight - list.scrollTop - list.clientHeight < 2
+  const top = list?.getBoundingClientRect().top || 0
+  const anchor = list && [...list.querySelectorAll(':scope > .msg-item')].find(row => row.getBoundingClientRect().bottom > top)
+  const offset = anchor?.getBoundingClientRect().top
+  searchOpen.value = open
+  await nextTick()
+  if (!list?.isConnected) return
+  if (bottom) list.scrollTop = list.scrollHeight - list.clientHeight
+  else if (anchor?.isConnected) list.scrollTop += anchor.getBoundingClientRect().top - offset
+}
 
 // Auth
 const authChecking = ref(true)
@@ -15,6 +37,10 @@ const authenticated = ref(false)
 const loginPassword = ref('')
 const loginError = ref('')
 const authToken = ref(localStorage.getItem('authToken') || '')
+if (isScreenshotMode) {
+  const qsToken = new URLSearchParams(location.search).get('token')
+  if (qsToken) authToken.value = qsToken
+}
 
 async function checkAuth() {
   try {
@@ -63,7 +89,9 @@ window.fetch = function(url, opts = {}) {
   return _origFetch.call(this, url, opts)
 }
 
-onMounted(checkAuth)
+onMounted(() => {
+  if (!isScreenshotMode) checkAuth()
+})
 
 const themes = [
   { id: 'dark',   label: '深蓝', color: '#1a1a2e' },
@@ -84,7 +112,7 @@ function applyTheme(id) {
 function selectConversation(conv) {
   activeConversation.value = conv
   searchHighlight.value = ''
-  sidebarOpen.value = false
+  if (mobileLayout.matches) sidebarOpen.value = false
 }
 
 function onConversationDeleted(convId) {
@@ -98,14 +126,16 @@ function navigateToMessage(item) {
     conv_id: item.conv_id,
     name: item.conv_name || '未知',
   }
-  searchHighlight.value = item.content?.substring(0, 20) || ''
+  searchHighlight.value = item.search_query ?? ''
   jumpToSeq.value = item.seq || null
 }
 </script>
 
 <template>
+  <!-- Screenshot mode: chrome-less static render for headless capture -->
+  <ScreenshotView v-if="isScreenshotMode" />
   <!-- Loading -->
-  <div v-if="authChecking" class="login-screen">
+  <div v-else-if="authChecking" class="login-screen">
     <div class="login-box">
       <div class="login-loading">Loading...</div>
     </div>
@@ -131,7 +161,7 @@ function navigateToMessage(item) {
   <!-- Main app -->
   <div v-else class="app-layout">
     <div class="sidebar-overlay" :class="{ visible: sidebarOpen }" @click="sidebarOpen = false"></div>
-    <div class="app-sidebar" :class="{ open: sidebarOpen }">
+    <div id="conversation-sidebar" class="app-sidebar" :class="{ open: sidebarOpen }" :inert="!sidebarOpen">
       <ConversationList
         :activeId="activeConversation?.conv_id"
         @select="selectConversation"
@@ -140,9 +170,11 @@ function navigateToMessage(item) {
     </div>
     <div class="app-main">
       <div class="app-toolbar">
-        <button class="sidebar-toggle" @click="sidebarOpen = !sidebarOpen">☰</button>
+        <button class="sidebar-toggle" :aria-label="sidebarOpen ? '收起会话列表' : '展开会话列表'" :title="sidebarOpen ? '收起会话列表' : '展开会话列表'" :aria-expanded="sidebarOpen" aria-controls="conversation-sidebar" @click="sidebarOpen = !sidebarOpen">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+        </button>
         <div class="app-title">抖音聊天记录</div>
-        <SearchBar @navigate="navigateToMessage" />
+        <button class="search-toggle" :disabled="!activeConversation" :aria-expanded="searchOpen" @click="setSearchOpen(!searchOpen)">⌕ 查找聊天记录</button>
         <div class="theme-switcher">
           <button
             v-for="t in themes"
@@ -155,17 +187,43 @@ function navigateToMessage(item) {
           />
         </div>
       </div>
-      <MessageList
-        :conversation="activeConversation"
-        :searchHighlight="searchHighlight"
-        :jumpToSeq="jumpToSeq"
-        @jumped="jumpToSeq = null"
-      />
+      <div ref="readerLayout" class="reader-layout">
+        <MessageList
+          :conversation="activeConversation"
+          :searchHighlight="searchHighlight"
+          :jumpToSeq="jumpToSeq"
+          @jumped="jumpToSeq = null"
+        />
+        <div v-if="searchOpen && activeConversation" class="search-slot">
+          <SearchBar :convId="activeConversation.conv_id" :convName="activeConversation.name" @navigate="navigateToMessage" @close="setSearchOpen(false)" />
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+/* Allocate the panel once; animate only its contents, without reflowing chat. */
+.search-slot > .search-panel { --panel-offset: 12px; animation: panel-enter .16s cubic-bezier(.2, 0, .2, 1); }
+.app-sidebar.open > :deep(.conv-list) { --panel-offset: -12px; animation: panel-enter .16s cubic-bezier(.2, 0, .2, 1); }
+@keyframes panel-enter {
+  from { opacity: .75; transform: translateX(var(--panel-offset)); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .search-slot > .search-panel, .app-sidebar.open > :deep(.conv-list) { animation: none; }
+}
+
+.reader-layout { display: flex; flex: 1; min-height: 0; overflow: hidden; position: relative; }
+.reader-layout > .msg-panel { min-width: 0; }
+.search-slot { flex: 0 0 320px; width: 320px; min-height: 0; overflow: hidden; }
+@media (max-width: 800px) {
+  .search-slot { position: absolute; inset: 0 0 0 auto; width: min(340px, 100%); z-index: 120; box-shadow: -8px 0 28px #0003; }
+}
+.search-toggle { padding: 5px 10px; background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border-color); border-radius: 6px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.search-toggle:hover:not(:disabled), .search-toggle[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
+.search-toggle:disabled { opacity: .4; cursor: default; }
+
 .login-screen {
   display: flex;
   align-items: center;
@@ -280,10 +338,6 @@ function navigateToMessage(item) {
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-.app-toolbar .search-container {
-  flex: 1;
-  max-width: 400px;
-}
 
 .theme-switcher {
   display: flex;
@@ -312,7 +366,7 @@ function navigateToMessage(item) {
 }
 
 .sidebar-toggle {
-  display: none;
+  display: flex;
   background: none;
   border: none;
   color: var(--text-primary);
@@ -330,6 +384,10 @@ function navigateToMessage(item) {
   display: none;
 }
 
+@media (min-width: 769px) {
+  .app-sidebar:not(.open) { display: none; }
+}
+
 @media (max-width: 768px) {
   .sidebar-toggle {
     display: block;
@@ -342,7 +400,6 @@ function navigateToMessage(item) {
     height: 100vh;
     z-index: 1000;
     transform: translateX(-100%);
-    transition: transform 0.25s ease;
     width: 280px;
   }
 
@@ -358,7 +415,6 @@ function navigateToMessage(item) {
     z-index: 999;
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.25s ease;
   }
 
   .sidebar-overlay.visible {
@@ -383,10 +439,5 @@ function navigateToMessage(item) {
     gap: 5px;
   }
 
-  .app-toolbar .search-container {
-    order: 1;
-    flex-basis: 100%;
-    max-width: none;
-  }
 }
 </style>
